@@ -1,0 +1,12 @@
+[Desktop Entry]
+Name=USB Guard
+GenericName=USB Device Control
+Comment=Review and control which USB devices may connect
+Type=Application
+Exec=cosmic-usb-guard
+Icon=io.github.stldave314.CosmicUsbGuard
+Terminal=false
+Categories=System;Security;
+Keywords=USB;USBGuard;Security;Device;Block;Allow;COSMIC;
+StartupNotify=true
+StartupWMClass=io.github.stldave314.CosmicUsbGuard

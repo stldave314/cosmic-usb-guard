@@ -1,0 +1,5 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+fallback_language = "en"
+
+[fluent]
+assets_dir = "i18n"

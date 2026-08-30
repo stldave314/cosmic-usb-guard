@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<!-- Application icon: a shield enclosing the USB trident. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="shield" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#4a90d9"/>
+      <stop offset="1" stop-color="#2a5d9e"/>
+    </linearGradient>
+  </defs>
+  <path fill="url(#shield)" d="M64 6 16 24v40c0 25.6 20 47.2 48 58 28-10.8 48-32.4 48-58V24z"/>
+  <path fill="#1c4270" d="M64 6v98c28-10.8 48-32.4 48-58V24z" opacity=".25"/>
+  <g fill="#ffffff">
+    <circle cx="64" cy="94" r="9"/>
+    <path d="M60 34h8v52h-8z"/>
+    <path d="M58 26h16v10H58z"/>
+    <path d="M64 62 84 50v-8h10v-12H76v12h4l-16 9.6z"/>
+    <path d="M44 50l8 14h-6v8h14v-8h-6l-4-7z"/>
+  </g>
+</svg>

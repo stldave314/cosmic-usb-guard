@@ -1,0 +1,119 @@
+[package]
+name = "cosmic-usb-guard"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.93"
+license = "GPL-3.0-or-later"
+description = "COSMIC desktop front-end and panel indicator for USBGuard"
+repository = "https://github.com/stldave314/cosmic-usb-guard"
+homepage = "https://github.com/stldave314/cosmic-usb-guard"
+readme = "README.md"
+keywords = ["cosmic", "usbguard", "usb", "security", "applet"]
+categories = ["gui", "os::linux-apis"]
+
+[lib]
+name = "cosmic_usb_guard"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cosmic-usb-guard"
+path = "src/bin/app.rs"
+
+[[bin]]
+name = "cosmic-usb-guard-applet"
+path = "src/bin/applet.rs"
+
+[features]
+default = []
+# Forces developer debug logging off at compile time. Every packaging target
+# passes this so a release can never ship with logging enabled.
+release-build = []
+
+[dependencies]
+anyhow = "1.0"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
+futures = "0.3"
+i18n-embed-fl = "0.10"
+log = "0.4"
+once_cell = "1"
+rust-embed = "8.11"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+zbus = { version = "5.15", default-features = false, features = ["tokio"] }
+
+[dependencies.i18n-embed]
+version = "0.16"
+features = ["fluent-system", "desktop-requester"]
+
+[dependencies.tokio]
+version = "1.52"
+features = ["macros", "rt-multi-thread", "sync", "time", "fs", "io-util", "process"]
+
+[dependencies.libcosmic]
+git = "https://github.com/pop-os/libcosmic"
+default-features = false
+features = [
+    "a11y",
+    "about",
+    "applet",
+    "dbus-config",
+    "desktop",
+    "multi-window",
+    "tokio",
+    "wayland",
+    "wgpu",
+    "winit",
+]
+
+# Packaging. `install.sh` drives both of these; the `release-build` feature has
+# to be passed to `cargo deb` explicitly because it runs its own build.
+[package.metadata.deb]
+# Deliberately the GitHub no-reply address, not a personal one.
+maintainer = "stldave314 <stldave314@users.noreply.github.com>"
+copyright = "2026, the cosmic-usb-guard contributors"
+license-file = ["LICENSE", "0"]
+extended-description = """
+A COSMIC desktop front-end and panel indicator for USBGuard. Prompts when a new
+USB device is connected, records every decision, and checks that USBGuard is
+actually protecting the system rather than merely installed."""
+section = "utils"
+priority = "optional"
+depends = "$auto, usbguard (>= 1.1.0)"
+recommends = "adwaita-icon-theme"
+assets = [
+    ["target/release/cosmic-usb-guard", "usr/bin/", "755"],
+    ["target/release/cosmic-usb-guard-applet", "usr/bin/", "755"],
+    ["res/io.github.stldave314.CosmicUsbGuard.desktop", "usr/share/applications/", "644"],
+    ["res/io.github.stldave314.CosmicUsbGuardApplet.desktop", "usr/share/applications/", "644"],
+    ["res/icons/hicolor/scalable/apps/io.github.stldave314.CosmicUsbGuard.svg", "usr/share/icons/hicolor/scalable/apps/", "644"],
+    ["res/icons/hicolor/scalable/apps/io.github.stldave314.CosmicUsbGuard-symbolic.svg", "usr/share/icons/hicolor/scalable/apps/", "644"],
+    ["res/io.github.stldave314.CosmicUsbGuard.metainfo.xml", "usr/share/metainfo/", "644"],
+    ["README.md", "usr/share/doc/cosmic-usb-guard/README.md", "644"],
+]
+
+[package.metadata.generate-rpm]
+summary = "COSMIC desktop front-end and panel indicator for USBGuard"
+license = "GPL-3.0-or-later"
+requires = { usbguard = ">= 1.1.0" }
+assets = [
+    { source = "target/release/cosmic-usb-guard", dest = "/usr/bin/cosmic-usb-guard", mode = "755" },
+    { source = "target/release/cosmic-usb-guard-applet", dest = "/usr/bin/cosmic-usb-guard-applet", mode = "755" },
+    { source = "res/io.github.stldave314.CosmicUsbGuard.desktop", dest = "/usr/share/applications/io.github.stldave314.CosmicUsbGuard.desktop", mode = "644" },
+    { source = "res/io.github.stldave314.CosmicUsbGuardApplet.desktop", dest = "/usr/share/applications/io.github.stldave314.CosmicUsbGuardApplet.desktop", mode = "644" },
+    { source = "res/icons/hicolor/scalable/apps/io.github.stldave314.CosmicUsbGuard.svg", dest = "/usr/share/icons/hicolor/scalable/apps/io.github.stldave314.CosmicUsbGuard.svg", mode = "644" },
+    { source = "res/icons/hicolor/scalable/apps/io.github.stldave314.CosmicUsbGuard-symbolic.svg", dest = "/usr/share/icons/hicolor/scalable/apps/io.github.stldave314.CosmicUsbGuard-symbolic.svg", mode = "644" },
+    { source = "res/io.github.stldave314.CosmicUsbGuard.metainfo.xml", dest = "/usr/share/metainfo/io.github.stldave314.CosmicUsbGuard.metainfo.xml", mode = "644" },
+    { source = "LICENSE", dest = "/usr/share/licenses/cosmic-usb-guard/LICENSE", mode = "644" },
+]
+
+[dev-dependencies]
+# Used to check that settings survive the encoding `cosmic-config` persists in.
+ron = "0.8"
+
+[profile.release]
+lto = "thin"
+opt-level = 2
+strip = true
+codegen-units = 4

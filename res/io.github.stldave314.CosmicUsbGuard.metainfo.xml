@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<component type="desktop-application">
+  <id>io.github.stldave314.CosmicUsbGuard</id>
+
+  <name>USB Guard</name>
+  <summary>Review and control which USB devices may connect</summary>
+
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+
+  <developer id="io.github.stldave314">
+    <name>stldave314</name>
+  </developer>
+
+  <description>
+    <p>
+      A COSMIC desktop front-end and panel indicator for USBGuard. Plug in a
+      device and you are asked about it, with enough information to answer.
+      Every decision is recorded, and you can change your mind later.
+    </p>
+    <p>Features:</p>
+    <ul>
+      <li>Prompts when a new device is connected, showing its name, IDs, serial number, port and interface classes</li>
+      <li>Warns about devices that present a keyboard interface and could inject keystrokes</li>
+      <li>Lists every device USBGuard can see, with internal hubs filtered out by default</li>
+      <li>Revoke removes a device's standing rule and blocks it in one step</li>
+      <li>Keeps a searchable history of every device event and decision</li>
+      <li>Checks that USBGuard is genuinely protecting the system, not merely installed, and gives you the command to fix each problem</li>
+    </ul>
+    <p>
+      This application enforces nothing itself. USBGuard does. It requires the
+      usbguard daemon and its D-Bus interface to be installed and running.
+    </p>
+  </description>
+
+  <launchable type="desktop-id">io.github.stldave314.CosmicUsbGuard.desktop</launchable>
+
+  <url type="homepage">https://github.com/stldave314/cosmic-usb-guard</url>
+  <url type="bugtracker">https://github.com/stldave314/cosmic-usb-guard/issues</url>
+  <url type="vcs-browser">https://github.com/stldave314/cosmic-usb-guard</url>
+
+  <categories>
+    <category>System</category>
+    <category>Security</category>
+    <category>Settings</category>
+  </categories>
+
+  <keywords>
+    <keyword>USB</keyword>
+    <keyword>USBGuard</keyword>
+    <keyword>security</keyword>
+    <keyword>device</keyword>
+    <keyword>COSMIC</keyword>
+  </keywords>
+
+  <supports>
+    <control>pointing</control>
+    <control>keyboard</control>
+  </supports>
+
+  <requires>
+    <display_length compare="ge">620</display_length>
+  </requires>
+
+  <content_rating type="oars-1.1"/>
+
+  <releases>
+    <release version="0.1.0" date="2026-08-29">
+      <description>
+        <p>First release.</p>
+      </description>
+    </release>
+  </releases>
+</component>

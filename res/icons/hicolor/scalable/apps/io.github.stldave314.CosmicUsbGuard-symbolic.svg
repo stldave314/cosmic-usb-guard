@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<!-- Symbolic icon: a shield (protection) enclosing the USB trident. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <g fill="#2e3436">
+    <path d="M8 0.75 1.75 3v5.1c0 3.2 2.5 5.9 6.25 7.15 3.75-1.25 6.25-3.95 6.25-7.15V3zm0 1.6 4.75 1.71v4.04c0 2.44-1.83 4.55-4.75 5.62-2.92-1.07-4.75-3.18-4.75-5.62V4.06z"/>
+    <path d="M7.5 4.25v6.02a1.25 1.25 0 1 0 1 0V8.4l1.6-1.05V6.1h.9V4.6h-2.4v1.5h.75l-.85.56V4.25zM5.9 6.5l.85 1.6H6.1v.9h1.4v-.9h-.65z"/>
+  </g>
+</svg>

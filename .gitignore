@@ -1,0 +1,19 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+
+# Editor and tooling
+.claude/
+.vscode/
+.idea/
+*.swp
+
+# Build and packaging output
+/dist/
+*.deb
+*.rpm
+*.tar.gz
+
+# Left behind only if a verification script is interrupted
+src/debug.rs.orig

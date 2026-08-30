@@ -1,0 +1,76 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  test:
+    name: Build and test
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            build-essential pkg-config cmake \
+            libudev-dev libdbus-1-dev libxkbcommon-dev libwayland-dev \
+            libssl-dev libexpat1-dev libfontconfig1-dev libfreetype6-dev \
+            libinput-dev libseat-dev libgbm-dev \
+            adwaita-icon-theme hicolor-icon-theme
+
+      # tests/icons.rs asserts a control icon exists before asserting ours do,
+      # so a runner without icon themes fails loudly rather than reporting
+      # green. Installing them above is what keeps that check meaningful.
+      - name: Confirm the icon theme fixture is present
+        run: test -d /usr/share/icons/Adwaita
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features
+
+      - name: Test
+        run: cargo test --all-features
+
+      - name: Build release
+        run: cargo build --release --features release-build
+
+      # Proves the release feature really removes developer logging, instead of
+      # trusting that the constant does what it says.
+      - name: Verify release-build strips debug logging
+        run: ./scripts/verify-release-build.sh
+
+  metadata:
+    name: Validate packaging metadata
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install validators
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            desktop-file-utils appstream
+
+      # Shared with local runs so the two cannot drift. The script tolerates
+      # exactly one known deviation (the COSMIC applet category) and fails on
+      # everything else.
+      - name: Validate desktop entries and AppStream metadata
+        run: ./scripts/validate-metadata.sh
