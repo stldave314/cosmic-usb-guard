@@ -132,6 +132,34 @@ pub trait Policy {
     fn remove_rule(&self, id: u32) -> zbus::Result<()>;
 }
 
+/// Subset of `org.freedesktop.PolicyKit1.Authority`.
+///
+/// Used to ask, without side effects and without raising a dialog, whether
+/// this session may perform a given USBGuard action. That question cannot be
+/// answered by trying the action: `removeRule` has no dry run, and the only
+/// way to discover it is refused would be to attempt a deletion.
+#[zbus::proxy(
+    interface = "org.freedesktop.PolicyKit1.Authority",
+    default_service = "org.freedesktop.PolicyKit1",
+    default_path = "/org/freedesktop/PolicyKit1/Authority"
+)]
+pub trait Polkit {
+    /// Whether `subject` is authorised for `action_id`.
+    ///
+    /// Returns `(authorized, challenge, details)`. `challenge` means the
+    /// action is permitted but only after the user authenticates, which is a
+    /// materially different answer from a flat refusal.
+    #[zbus(name = "CheckAuthorization")]
+    fn check_authorization(
+        &self,
+        subject: &(&str, HashMap<&str, zbus::zvariant::Value<'_>>),
+        action_id: &str,
+        details: HashMap<&str, &str>,
+        flags: u32,
+        cancellation_id: &str,
+    ) -> zbus::Result<(bool, bool, HashMap<String, String>)>;
+}
+
 /// Subset of `org.freedesktop.systemd1.Manager` used for health checks.
 ///
 /// Read-only, and reachable without authentication, so this tells us whether

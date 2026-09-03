@@ -15,16 +15,20 @@
 
   <description>
     <p>
-      A COSMIC desktop front-end and panel indicator for USBGuard. Plug in a
-      device and you are asked about it, with enough information to answer.
-      Every decision is recorded, and you can change your mind later.
+      A COSMIC desktop front-end for USBGuard, with a system-tray status icon.
+      Plug in a device and you are asked about it, with enough information to
+      answer. Every decision is recorded, and you can change your mind later.
     </p>
     <p>Features:</p>
     <ul>
       <li>Prompts when a new device is connected, showing its name, IDs, serial number, port and interface classes</li>
       <li>Warns about devices that present a keyboard interface and could inject keystrokes</li>
       <li>Lists every device USBGuard can see, with internal hubs filtered out by default</li>
+      <li>Lists devices that are not plugged in but still have a standing rule, so a decision can be changed without them</li>
       <li>Revoke removes a device's standing rule and blocks it in one step</li>
+      <li>Optionally runs a program of your choosing when a specific trusted device is connected and authorised</li>
+      <li>Notifies when a standing rule refuses a device without asking, so it does not just silently fail to work</li>
+      <li>Shows a status icon in the system tray and can start with your session</li>
       <li>Keeps a searchable history of every device event and decision</li>
       <li>Checks that USBGuard is genuinely protecting the system, not merely installed, and gives you the command to fix each problem</li>
     </ul>

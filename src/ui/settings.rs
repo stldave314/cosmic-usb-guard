@@ -74,6 +74,18 @@ pub fn view<'a>(state: &State) -> Element<'a, Action> {
             SettingChange::ShowRootHubs,
         ))
         .add(toggle(
+            fl!("setting-show-internal"),
+            fl!("setting-show-internal-description"),
+            settings.show_internal,
+            SettingChange::ShowInternal,
+        ))
+        .add(toggle(
+            fl!("setting-show-disconnected"),
+            fl!("setting-show-disconnected-description"),
+            settings.show_disconnected,
+            SettingChange::ShowDisconnected,
+        ))
+        .add(toggle(
             fl!("setting-warn-input-capable"),
             fl!("setting-warn-input-capable-description"),
             settings.warn_input_capable,
@@ -84,6 +96,42 @@ pub fn view<'a>(state: &State) -> Element<'a, Action> {
             fl!("setting-warn-on-health-problems-description"),
             settings.warn_on_health_problems,
             SettingChange::WarnOnHealthProblems,
+        ))
+        .add(toggle(
+            fl!("setting-notify-on-auto-block"),
+            fl!("setting-notify-on-auto-block-description"),
+            settings.notify_on_auto_block,
+            SettingChange::NotifyOnAutoBlock,
+        ));
+
+    // Autostart is read from the file on disk rather than the stored flag, so
+    // an entry removed by a desktop's own startup-applications editor shows as
+    // off here instead of the two disagreeing.
+    let startup = settings::section()
+        .title(fl!("section-startup"))
+        .add(toggle(
+            fl!("setting-show-tray-icon"),
+            fl!("setting-show-tray-icon-description"),
+            settings.show_tray_icon,
+            SettingChange::ShowTrayIcon,
+        ))
+        .add(toggle(
+            fl!("setting-run-in-background"),
+            fl!("setting-run-in-background-description"),
+            settings.run_in_background,
+            SettingChange::RunInBackground,
+        ))
+        .add(toggle(
+            fl!("setting-autostart"),
+            fl!("setting-autostart-description"),
+            crate::autostart::is_enabled(),
+            SettingChange::Autostart,
+        ))
+        .add(toggle(
+            fl!("setting-start-minimized"),
+            fl!("setting-start-minimized-description"),
+            settings.start_minimized,
+            SettingChange::StartMinimized,
         ));
 
     let history = settings::section()
@@ -98,8 +146,9 @@ pub fn view<'a>(state: &State) -> Element<'a, Action> {
             SettingChange::JournalEnabled,
         ));
 
-    column::with_capacity(4)
+    column::with_capacity(5)
         .push(text::title3(fl!("page-settings")))
+        .push(startup)
         .push(behaviour)
         .push(display)
         .push(history)

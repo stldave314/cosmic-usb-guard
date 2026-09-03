@@ -176,9 +176,13 @@ pub fn view<'a>(state: &State) -> Element<'a, Action> {
 
     let mut content = column::with_capacity(state.health.checks.len() + 3)
         .push(
+            // `title4`, not `title3`. Unlike the other pages' headings this
+            // one is a whole sentence, and at `title3` next to a fixed-width
+            // Refresh button it wrapped to three oversized lines in the
+            // remaining column.
             row::with_capacity(3)
                 .push(icon::from_name(icons::for_severity(severity)).size(32))
-                .push(text::title3(headline).width(Length::Fill))
+                .push(text::title4(headline).width(Length::Fill))
                 .push(button::standard(fl!("refresh")).on_press(Action::Refresh))
                 .align_y(Alignment::Center)
                 .spacing(space.space_s),

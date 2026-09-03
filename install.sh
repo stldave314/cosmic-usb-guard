@@ -25,9 +25,7 @@ PREFIX="${PREFIX:-/usr}"
 DESTDIR="${DESTDIR:-}"
 
 APP_ID="io.github.stldave314.CosmicUsbGuard"
-APPLET_ID="io.github.stldave314.CosmicUsbGuardApplet"
 BIN_APP="cosmic-usb-guard"
-BIN_APPLET="cosmic-usb-guard-applet"
 DIST="dist"
 
 # Every packaging target passes this. It forces developer debug logging off at
@@ -58,7 +56,7 @@ cmd_build() {
     need cargo "install a Rust toolchain from https://rustup.rs"
     info "Building (features: $FEATURES)"
     cargo build --release --features "$FEATURES"
-    info "Built target/release/$BIN_APP and target/release/$BIN_APPLET"
+    info "Built target/release/$BIN_APP"
 }
 
 # Install into $1 (a staging root, possibly empty for a real install).
@@ -68,12 +66,9 @@ stage() {
     local runner=("${@:2}")
 
     "${runner[@]}" install -Dm755 "target/release/$BIN_APP"    "$root$PREFIX/bin/$BIN_APP"
-    "${runner[@]}" install -Dm755 "target/release/$BIN_APPLET" "$root$PREFIX/bin/$BIN_APPLET"
 
     "${runner[@]}" install -Dm644 "res/$APP_ID.desktop" \
         "$root$PREFIX/share/applications/$APP_ID.desktop"
-    "${runner[@]}" install -Dm644 "res/$APPLET_ID.desktop" \
-        "$root$PREFIX/share/applications/$APPLET_ID.desktop"
 
     "${runner[@]}" install -Dm644 "res/icons/hicolor/scalable/apps/$APP_ID.svg" \
         "$root$PREFIX/share/icons/hicolor/scalable/apps/$APP_ID.svg"
@@ -94,8 +89,8 @@ cmd_install() {
         info "Staging into $DESTDIR$PREFIX"
         stage "$DESTDIR"
     else
-        # The applet's desktop entry must be in the system scan path or
-        # cosmic-panel will not offer it, so this installs system-wide.
+        # Installed system-wide so the desktop entry lands in the scan path
+        # the launcher and the autostart machinery both read.
         info "Installing into $PREFIX (requires root)"
         stage "" as_root
         as_root update-desktop-database "$PREFIX/share/applications" 2>/dev/null || true
@@ -104,8 +99,8 @@ cmd_install() {
 
     info "Installed."
     echo
-    echo "  Next: add the indicator in Settings -> Desktop -> Panel -> Configure panel applets."
-    echo "  Then open USB Guard and check the Status page."
+    echo "  Next: launch USB Guard. The status icon appears in the system tray"
+    echo "  on its own; there is no panel applet to add. Check the Status page."
     echo
     if ! command -v usbguard >/dev/null 2>&1; then
         warn "usbguard is not installed; this app has nothing to talk to."
@@ -120,9 +115,7 @@ cmd_uninstall() {
     info "Removing installed files from $PREFIX"
     as_root rm -f \
         "$PREFIX/bin/$BIN_APP" \
-        "$PREFIX/bin/$BIN_APPLET" \
         "$PREFIX/share/applications/$APP_ID.desktop" \
-        "$PREFIX/share/applications/$APPLET_ID.desktop" \
         "$PREFIX/share/icons/hicolor/scalable/apps/$APP_ID.svg" \
         "$PREFIX/share/icons/hicolor/scalable/apps/$APP_ID-symbolic.svg" \
         "$PREFIX/share/metainfo/$APP_ID.metainfo.xml"

@@ -69,8 +69,8 @@ jobs:
           sudo apt-get install --no-install-recommends -y \
             desktop-file-utils appstream
 
-      # Shared with local runs so the two cannot drift. The script tolerates
-      # exactly one known deviation (the COSMIC applet category) and fails on
-      # everything else.
+      # Shared with local runs so the two cannot drift. Every finding from
+      # desktop-file-validate and appstreamcli is a hard failure; the script
+      # is deliberately not a blanket `|| true`.
       - name: Validate desktop entries and AppStream metadata
         run: ./scripts/validate-metadata.sh

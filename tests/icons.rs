@@ -92,6 +92,10 @@ fn all_icons() -> Vec<(&'static str, &'static str)> {
         ("REMOVE", icons::REMOVE),
         ("COPY", icons::COPY),
         ("REFRESH", icons::REFRESH),
+        ("QUIT", icons::QUIT),
+        ("HOOK", icons::HOOK),
+        ("HISTORY", icons::HISTORY),
+        ("SETTINGS", icons::SETTINGS),
         ("PANEL_OK", icons::PANEL_OK),
         ("PANEL_WARNING", icons::PANEL_WARNING),
         ("PANEL_CRITICAL", icons::PANEL_CRITICAL),
@@ -135,6 +139,78 @@ fn every_icon_name_resolves() {
     assert!(
         missing.is_empty(),
         "these icon names do not resolve and would render as blank squares: {missing:#?}"
+    );
+}
+
+/// Icon themes we treat as the portability baseline.
+///
+/// `every_icon_name_resolves` searches every installed theme, which on a
+/// Pop!_OS or GNOME machine includes names that exist nowhere else. That is
+/// how `audio-card-usb-symbolic` passed locally and failed on a stock runner.
+/// Checking against a baseline theme catches it before it is pushed.
+const BASELINE_THEMES: &[&str] = &["Adwaita", "hicolor"];
+
+fn baseline_roots() -> Vec<PathBuf> {
+    icon_roots()
+        .iter()
+        .flat_map(|root| BASELINE_THEMES.iter().map(move |theme| root.join(theme)))
+        .filter(|path| path.is_dir())
+        .collect()
+}
+
+fn resolves_in_baseline(name: &str) -> bool {
+    fn search(dir: &Path, name: &str, depth: usize) -> bool {
+        if depth > 6 {
+            return false;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return false;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if path.is_dir() {
+                if search(&path, name, depth + 1) {
+                    return true;
+                }
+            } else if path.file_stem().and_then(|s| s.to_str()) == Some(name)
+                && matches!(
+                    path.extension().and_then(|e| e.to_str()),
+                    Some("svg" | "png" | "xpm")
+                )
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    baseline_roots().iter().any(|root| search(root, name, 0))
+}
+
+#[test]
+fn every_icon_name_resolves_in_a_baseline_theme() {
+    // Fixture guard: without a baseline theme this would check nothing.
+    assert!(
+        !baseline_roots().is_empty(),
+        "no baseline icon theme found (looked for {BASELINE_THEMES:?}); \
+         install adwaita-icon-theme before running the test suite"
+    );
+    assert!(
+        resolves_in_baseline("dialog-warning-symbolic"),
+        "the baseline theme is present but does not contain a control icon, \
+         so this check could not detect a non-portable name"
+    );
+
+    let missing: Vec<String> = all_icons()
+        .into_iter()
+        .filter(|(_, name)| !resolves_in_baseline(name))
+        .map(|(constant, name)| format!("{constant} = {name}"))
+        .collect();
+
+    assert!(
+        missing.is_empty(),
+        "these icon names exist only in a theme this machine happens to have, \
+         and would render as blank squares elsewhere: {missing:#?}"
     );
 }
 

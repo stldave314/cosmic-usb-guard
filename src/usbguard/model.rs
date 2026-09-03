@@ -141,11 +141,49 @@ impl fmt::Display for Interface {
     }
 }
 
+/// Whether an entry describes a device plugged in now, or one remembered from
+/// the policy.
+///
+/// The distinction has to be in the type rather than a sentinel ID, because
+/// the two are acted on through completely different daemon calls: a connected
+/// device is changed with `applyDevicePolicy`, and a remembered one can only
+/// have its rule rewritten. Handing a made-up ID to `applyDevicePolicy` would
+/// apply the decision to whichever device happens to hold that ID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Presence {
+    /// Plugged in now, with the ID the daemon assigned it.
+    ///
+    /// The ID is stable only while the device stays plugged in, and is reused
+    /// once it is gone.
+    Connected(u32),
+    /// Not plugged in, reconstructed from the standing policy rule that
+    /// remembers it.
+    Remembered,
+}
+
+/// How the interface identifies a device across a refresh.
+///
+/// Deliberately not a bare `u32`. Daemon device IDs and policy rule IDs are
+/// both small integers from overlapping ranges, so flattening the two into one
+/// number would let a click on a remembered device act on an unrelated
+/// connected one.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum DeviceKey {
+    /// A connected device, by its daemon-assigned ID.
+    Connected(u32),
+    /// A remembered device, by its descriptor hash.
+    ///
+    /// Keyed on the hash rather than the rule ID because removing a rule
+    /// renumbers every rule after it, so a rule ID does not survive the very
+    /// operation this key exists to perform.
+    Remembered(String),
+}
+
 /// A USB device as USBGuard sees it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Device {
-    /// Daemon-assigned device ID. Stable only while the device stays plugged in.
-    pub id: u32,
+    /// Whether the device is plugged in, and its daemon ID if it is.
+    pub presence: Presence,
     /// Current authorisation target.
     pub target: Target,
     /// Vendor ID, as four lowercase hex digits.
@@ -174,6 +212,23 @@ pub struct Device {
 impl Device {
     /// Build a device from the `(id, rule)` pair returned by `listDevices`.
     pub fn from_rule(id: u32, rule_text: &str) -> Result<Self, ParseError> {
+        Self::parse(Presence::Connected(id), rule_text)
+    }
+
+    /// Build a device from a standing policy rule, for something that is not
+    /// currently plugged in.
+    ///
+    /// Returns `None` for a rule with no `hash` attribute. Without the hash
+    /// there is no durable identity to key on, and a rule matching by USB ID
+    /// describes every device that claims those IDs rather than one device —
+    /// so presenting it as "a device" and offering buttons that rewrite it
+    /// would misrepresent what the rule does.
+    pub fn remembered(rule_text: &str) -> Option<Self> {
+        let device = Self::parse(Presence::Remembered, rule_text).ok()?;
+        (!device.hash.is_empty()).then_some(device)
+    }
+
+    fn parse(presence: Presence, rule_text: &str) -> Result<Self, ParseError> {
         let rule = Rule::parse(rule_text)?;
 
         let (vendor_id, product_id) = rule
@@ -189,7 +244,7 @@ impl Device {
             .collect();
 
         Ok(Self {
-            id,
+            presence,
             target: rule.target,
             vendor_id,
             product_id,
@@ -208,6 +263,30 @@ impl Device {
             interfaces,
             rule: rule_text.to_string(),
         })
+    }
+
+    /// The daemon-assigned ID, or `None` when the device is not plugged in.
+    ///
+    /// Every call that changes a live device's authorisation goes through
+    /// this, so a remembered device cannot reach `applyDevicePolicy` at all.
+    pub fn daemon_id(&self) -> Option<u32> {
+        match self.presence {
+            Presence::Connected(id) => Some(id),
+            Presence::Remembered => None,
+        }
+    }
+
+    /// Whether the device is plugged in right now.
+    pub fn is_connected(&self) -> bool {
+        matches!(self.presence, Presence::Connected(_))
+    }
+
+    /// How the interface refers to this device.
+    pub fn key(&self) -> DeviceKey {
+        match self.presence {
+            Presence::Connected(id) => DeviceKey::Connected(id),
+            Presence::Remembered => DeviceKey::Remembered(self.hash.clone()),
+        }
     }
 
     /// `vvvv:pppp`, the conventional way to write a USB ID.
@@ -234,7 +313,16 @@ impl Device {
         if !self.via_port.is_empty() {
             return format!("port {}", self.via_port);
         }
-        format!("device {}", self.id)
+        match self.presence {
+            Presence::Connected(id) => format!("device {id}"),
+            // A remembered device has no port and no ID to fall back to, so
+            // the hash is all that is left. Truncated because the full one is
+            // 44 characters and would swamp the row; the detail view shows it
+            // in full.
+            Presence::Remembered => {
+                format!("device {}", self.hash.chars().take(12).collect::<String>())
+            }
+        }
     }
 
     /// Distinct interface class names, in first-seen order.
@@ -294,6 +382,32 @@ impl Device {
             super::rule::quote(&self.hash)
         ))
     }
+
+    /// This device's own rule text with a different target.
+    ///
+    /// Used to change a decision about a device that is not plugged in, where
+    /// there is nothing to authorise now and the rule is the only thing that
+    /// can be rewritten. The rest of the rule is carried over verbatim so the
+    /// policy keeps the name, serial and interface list that make it legible;
+    /// only the leading target keyword changes.
+    ///
+    /// Returns `None` unless the rule is pinned to this device's hash, so this
+    /// can never widen a rule from one device to a whole class of them, and
+    /// falls back to [`Device::permanent_rule`] if the text does not start
+    /// with the target it parsed as.
+    pub fn retargeted_rule(&self, target: Target) -> Option<String> {
+        if self.hash.is_empty() {
+            return None;
+        }
+        let rest = self
+            .rule
+            .strip_prefix(self.target.keyword())
+            .filter(|rest| rest.starts_with(char::is_whitespace));
+        match rest {
+            Some(rest) => Some(format!("{}{rest}", target.keyword())),
+            None => self.permanent_rule(target),
+        }
+    }
 }
 
 /// A rule in the daemon's policy, with the ID needed to remove it.
@@ -318,6 +432,11 @@ impl PolicyRule {
     pub fn hash(&self) -> Option<&str> {
         self.rule.attribute("hash")
     }
+
+    /// The device this rule remembers, if it pins one specifically.
+    pub fn device(&self) -> Option<Device> {
+        Device::remembered(&self.rule.raw)
+    }
 }
 
 #[cfg(test)]
@@ -333,7 +452,8 @@ mod tests {
     #[test]
     fn builds_a_device_from_a_rule() {
         let device = Device::from_rule(7, KEYBOARD).unwrap();
-        assert_eq!(device.id, 7);
+        assert_eq!(device.daemon_id(), Some(7));
+        assert!(device.is_connected());
         assert_eq!(device.target, Target::Block);
         assert_eq!(device.vendor_id, "046d");
         assert_eq!(device.product_id, "c31c");
@@ -359,6 +479,52 @@ mod tests {
         let parsed = Rule::parse(&rule).unwrap();
         assert_eq!(parsed.target, Target::Allow);
         assert_eq!(parsed.attribute("hash"), Some("AbCdEf0123456789+/="));
+    }
+
+    #[test]
+    fn retargeting_keeps_the_hash_pin_and_the_readable_attributes() {
+        // Changing a decision about an unplugged device means rewriting its
+        // rule. Everything that identifies the device has to survive, and the
+        // hash pin above all — a rule that lost it would match every device
+        // claiming the same vendor and product.
+        let device = Device::remembered(KEYBOARD).unwrap();
+        let rule = device.retargeted_rule(Target::Allow).unwrap();
+
+        assert!(rule.starts_with("allow "), "{rule}");
+        assert!(!rule.contains("block"));
+        assert!(rule.contains(r#"hash "AbCdEf0123456789+/=""#));
+        assert!(rule.contains(r#"name "USB Keyboard""#));
+        // And the result must be something the daemon will accept back.
+        let parsed = Rule::parse(&rule).unwrap();
+        assert_eq!(parsed.target, Target::Allow);
+    }
+
+    #[test]
+    fn a_rule_without_a_hash_is_not_a_device() {
+        // `allow id 1234:5678` describes every device claiming those IDs, not
+        // one device. Presenting it as a row with buttons that rewrite it
+        // would misrepresent what the rule does.
+        assert!(Device::remembered(r#"allow id 1234:5678 name "Any""#).is_none());
+        assert!(Device::remembered(r#"allow hash "AAA=""#).is_some());
+    }
+
+    #[test]
+    fn a_remembered_device_has_no_daemon_id() {
+        // The type is what stops an unplugged device reaching
+        // `applyDevicePolicy`, where the ID would address something else.
+        let device = Device::remembered(KEYBOARD).unwrap();
+        assert_eq!(device.daemon_id(), None);
+        assert!(!device.is_connected());
+        assert_eq!(device.presence, Presence::Remembered);
+    }
+
+    #[test]
+    fn a_remembered_device_still_has_something_to_call_itself() {
+        let anonymous = Device::remembered(r#"block hash "QUJDREVGR0hJSktM""#).unwrap();
+        let name = anonymous.display_name();
+        assert!(!name.is_empty());
+        // Truncated: the full hash is 44 characters and would swamp the row.
+        assert!(name.len() < 24, "{name}");
     }
 
     #[test]

@@ -8,7 +8,8 @@
 
 use cosmic::iced::{Subscription, stream};
 
-use crate::constants::HEALTH_POLL_INTERVAL;
+use crate::constants::REFRESH_INTERVAL;
+use crate::tray::TrayEvent;
 use crate::usbguard::Event;
 
 /// A self-healing stream of USBGuard events.
@@ -24,12 +25,13 @@ pub fn usbguard_events() -> Subscription<Event> {
     })
 }
 
-/// Ticks on which to re-run the installation health checks.
+/// Ticks on which to re-read devices, policy and health.
 ///
-/// Health depends on systemd unit state and daemon parameters, neither of
-/// which signals a change, so it has to be polled.
-pub fn health_ticks() -> Subscription<()> {
-    cosmic::iced::time::every(HEALTH_POLL_INTERVAL).map(|_| ())
+/// Neither systemd unit state nor daemon parameters signal a change, so they
+/// have to be polled; the device list rides along as a safety net for a
+/// missed signal.
+pub fn refresh_ticks() -> Subscription<()> {
+    cosmic::iced::time::every(REFRESH_INTERVAL).map(|_| ())
 }
 
 /// Actions the user activated on one of our desktop notifications.
@@ -61,6 +63,36 @@ pub fn notification_actions() -> Subscription<(u32, String)> {
                     // ending the subscription, since one can appear later in the
                     // session.
                     tokio::time::sleep(crate::constants::RECONNECT_DELAY).await;
+                }
+            },
+        )
+    })
+}
+
+/// Choices the user made in the status icon.
+///
+/// The tray runs on its own connection inside `ksni` and cannot touch
+/// application state, so it reports here and the update loop applies the
+/// change like any other message.
+pub fn tray_events() -> Subscription<TrayEvent> {
+    Subscription::run(|| {
+        stream::channel(
+            8,
+            |mut output: futures::channel::mpsc::Sender<TrayEvent>| async move {
+                use futures::SinkExt;
+
+                let Some(mut receiver) = crate::tray::take_receiver().await else {
+                    // Already taken: the runtime restarted this subscription.
+                    // Ending is correct — a second drain would steal events
+                    // from the first.
+                    std::future::pending::<()>().await;
+                    return;
+                };
+
+                while let Some(event) = receiver.recv().await {
+                    if output.send(event).await.is_err() {
+                        return;
+                    }
                 }
             },
         )

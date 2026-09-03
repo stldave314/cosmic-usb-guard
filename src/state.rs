@@ -13,7 +13,67 @@ use crate::config::ConfigState;
 use crate::debug_log;
 use crate::journal::{self, Actor, Entry, Kind};
 use crate::ui::{HistoryFilter, SettingChange};
-use crate::usbguard::{Device, Event, Health, PresenceEvent, Target};
+use crate::usbguard::{Device, DeviceKey, Event, Health, PolicyRule, PresenceEvent, Target};
+
+/// A hook being edited, before it is saved.
+///
+/// Kept as strings because that is what the text inputs hold; conversion and
+/// validation happen once, on save, so a half-typed path is never written to
+/// the config and never runs.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HookDraft {
+    /// Descriptor hash of the device being configured.
+    pub hash: String,
+    /// What the user is calling it.
+    pub label: String,
+    /// Absolute path to the program.
+    pub program: String,
+    /// Arguments, one per line.
+    ///
+    /// Newline-separated rather than space-separated because there is no shell
+    /// to do the splitting, so a space-separated field would silently make
+    /// `--dir /my documents` into three arguments.
+    pub args: String,
+    /// Whether it is active.
+    pub enabled: bool,
+}
+
+impl HookDraft {
+    /// Start editing a device's hook, or a blank one if it has none.
+    pub fn new(hash: String, existing: Option<&crate::hooks::Hook>) -> Self {
+        match existing {
+            Some(hook) => Self {
+                hash,
+                label: hook.label.clone(),
+                program: hook.program.display().to_string(),
+                args: hook.args.join("\n"),
+                enabled: hook.enabled,
+            },
+            None => Self {
+                hash,
+                enabled: true,
+                ..Self::default()
+            },
+        }
+    }
+
+    /// The hook this draft describes.
+    pub fn to_hook(&self) -> crate::hooks::Hook {
+        crate::hooks::Hook {
+            hash: self.hash.clone(),
+            program: std::path::PathBuf::from(self.program.trim()),
+            args: self
+                .args
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(str::to_string)
+                .collect(),
+            enabled: self.enabled,
+            label: self.label.trim().to_string(),
+        }
+    }
+}
 
 /// A device waiting for the user to decide about it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,8 +98,12 @@ pub enum Effect {
     Notify(u32),
     /// Withdraw the notification with this ID.
     CloseNotification(u32),
-    /// Open the applet popup, because a decision is waiting.
-    OpenPopup,
+    /// Tell the user a device was refused without being asked about.
+    NotifyAutoBlocked(u32),
+    /// Show the window, because a decision is waiting.
+    ShowWindow,
+    /// Run this device's configured hook program.
+    RunHook(u32),
     /// Re-read the journal from disk.
     ReloadHistory,
 }
@@ -53,8 +117,14 @@ pub struct State {
     pub connected: bool,
     /// Why not, when `connected` is false.
     pub disconnect_reason: String,
-    /// Devices, as last reported.
+    /// Devices the daemon currently reports as present.
     pub devices: Vec<Device>,
+    /// Devices reconstructed from standing policy rules.
+    ///
+    /// Kept unfiltered; [`State::remembered_devices`] drops the ones that are
+    /// also plugged in, so a device that arrives between a policy read and a
+    /// device read cannot appear in both lists at once.
+    policy_devices: Vec<Device>,
     /// Installation health.
     pub health: Health,
     /// Whether health has been evaluated at least once.
@@ -65,21 +135,33 @@ pub struct State {
     /// Devices awaiting a decision.
     pub pending: Vec<Pending>,
     /// Device whose details are expanded.
-    pub selected: Option<u32>,
+    pub selected: Option<DeviceKey>,
     /// Whether the next decision is written as a standing rule.
     pub permanent: bool,
     /// Devices with an in-flight request, so their buttons can be disabled.
-    pub busy: HashSet<u32>,
+    pub busy: HashSet<DeviceKey>,
     /// The last error worth showing the user.
     pub error: Option<String>,
     /// Journal entries for the history view.
     pub history: Vec<Entry>,
     /// Which entries the history view lists.
     pub history_filter: HistoryFilter,
-    /// Descriptor hashes that already have a standing policy rule.
-    pub known_hashes: HashSet<String>,
-    /// Whether `known_hashes` reflects a successful policy read.
-    known_hashes_loaded: bool,
+    /// The hook currently being edited, if any.
+    pub hook_draft: Option<HookDraft>,
+    /// Hashes whose hook has already run since the device was last connected.
+    ///
+    /// A device is announced by an insert signal and again by whatever policy
+    /// signal follows it; without this the hook would run twice for one plug.
+    /// Cleared when the device is removed, so replugging runs it again.
+    hooks_fired: HashSet<String>,
+    /// What the policy says about each device hash it pins a rule to.
+    ///
+    /// The target matters, not just the presence of a rule: undoing a decision
+    /// means noticing that the standing rule contradicts what the user is now
+    /// asking for.
+    standing: HashMap<String, Target>,
+    /// Whether `standing` reflects a successful policy read.
+    standing_loaded: bool,
 }
 
 impl Default for State {
@@ -91,6 +173,7 @@ impl Default for State {
             connected: false,
             disconnect_reason: String::new(),
             devices: Vec::new(),
+            policy_devices: Vec::new(),
             health: Health::default(),
             health_checked: false,
             pending: Vec::new(),
@@ -99,8 +182,10 @@ impl Default for State {
             error: None,
             history: Vec::new(),
             history_filter: HistoryFilter::default(),
-            known_hashes: HashSet::new(),
-            known_hashes_loaded: false,
+            hook_draft: None,
+            hooks_fired: HashSet::new(),
+            standing: HashMap::new(),
+            standing_loaded: false,
         }
     }
 }
@@ -113,9 +198,35 @@ impl State {
 
     // -- queries ----------------------------------------------------------
 
-    /// Look up a device by daemon ID.
+    /// Look up a connected device by daemon ID.
     pub fn device(&self, id: u32) -> Option<&Device> {
-        self.devices.iter().find(|d| d.id == id)
+        self.devices.iter().find(|d| d.daemon_id() == Some(id))
+    }
+
+    /// Look up any device the interface can refer to, connected or remembered.
+    pub fn device_by_key(&self, key: &DeviceKey) -> Option<&Device> {
+        match key {
+            DeviceKey::Connected(id) => self.device(*id),
+            DeviceKey::Remembered(hash) => self
+                .policy_devices
+                .iter()
+                .find(|d| &d.hash == hash)
+                .filter(|_| !self.is_connected_hash(hash)),
+        }
+    }
+
+    /// Whether the user has marked this device as part of the machine.
+    ///
+    /// Keyed on the descriptor hash, the same identity permanent rules use: a
+    /// mark keyed on the USB ID would follow any device that claimed those IDs,
+    /// which is the property this app exists to deny.
+    pub fn is_internal(&self, device: &Device) -> bool {
+        !device.hash.is_empty() && self.config.settings.internal_hashes.contains(&device.hash)
+    }
+
+    /// Whether a device with this hash is plugged in right now.
+    fn is_connected_hash(&self, hash: &str) -> bool {
+        !hash.is_empty() && self.devices.iter().any(|d| d.hash == hash)
     }
 
     /// Whether a device should be shown given the current filters.
@@ -123,8 +234,11 @@ impl State {
     /// A device awaiting a decision is always shown, whatever the filters say:
     /// hiding something the user must act on would be a bug, not a preference.
     pub fn is_visible(&self, device: &Device) -> bool {
-        if self.is_pending(device.id) {
+        if device.daemon_id().is_some_and(|id| self.is_pending(id)) {
             return true;
+        }
+        if self.is_internal(device) && !self.config.settings.show_internal {
+            return false;
         }
         if device.is_root_hub() && !self.config.settings.show_root_hubs {
             return false;
@@ -151,17 +265,65 @@ impl State {
                         .to_lowercase()
                         .cmp(&b.display_name().to_lowercase())
                 })
-                .then_with(|| a.id.cmp(&b.id))
+                .then_with(|| a.daemon_id().cmp(&b.daemon_id()))
+        });
+        devices
+    }
+
+    /// Devices the policy remembers that are not plugged in right now.
+    ///
+    /// This is how a decision stays reversible after the device is unplugged.
+    /// Without it a permanent block or reject can only be undone by plugging
+    /// the device back in — and a *rejected* device is detached from the
+    /// system on sight, so replugging it does not reliably bring back a row to
+    /// click either.
+    pub fn remembered_devices(&self) -> Vec<&Device> {
+        if !self.config.settings.show_disconnected {
+            return Vec::new();
+        }
+        let mut devices: Vec<&Device> = self
+            .policy_devices
+            .iter()
+            .filter(|device| !self.is_connected_hash(&device.hash))
+            .filter(|device| self.is_visible(device))
+            .collect();
+
+        devices.sort_by(|a, b| {
+            sort_rank(self, a).cmp(&sort_rank(self, b)).then_with(|| {
+                a.display_name()
+                    .to_lowercase()
+                    .cmp(&b.display_name().to_lowercase())
+            })
         });
         devices
     }
 
     /// How many devices the current filters are hiding.
+    ///
+    /// Counts what the two lists actually drop, which for remembered devices
+    /// includes the whole section when `show_disconnected` is off —
+    /// [`State::is_visible`] does not know about that filter, so counting
+    /// through it alone would under-report and the caption would claim fewer
+    /// devices were hidden than the list is hiding.
     pub fn hidden_count(&self) -> usize {
-        self.devices
+        let connected = self
+            .devices
             .iter()
             .filter(|device| !self.is_visible(device))
-            .count()
+            .count();
+
+        let remembered = self
+            .policy_devices
+            .iter()
+            .filter(|d| !self.is_connected_hash(&d.hash));
+
+        let remembered = if self.config.settings.show_disconnected {
+            remembered.filter(|d| !self.is_visible(d)).count()
+        } else {
+            remembered.count()
+        };
+
+        connected + remembered
     }
 
     /// Whether this device is awaiting a decision.
@@ -177,14 +339,30 @@ impl State {
             .collect()
     }
 
-    /// Whether a device has a standing policy rule pinned to its hash.
+    /// What the policy will do to this device the next time it is connected.
     ///
-    /// Returns `false` when the policy could not be read, which makes the
-    /// prompt logic fail towards asking rather than towards silence.
+    /// Returns `None` when the policy could not be read, which makes the prompt
+    /// logic fail towards asking rather than towards silence.
+    pub fn standing_target(&self, device: &Device) -> Option<Target> {
+        if !self.standing_loaded || device.hash.is_empty() {
+            return None;
+        }
+        self.standing.get(&device.hash).copied()
+    }
+
+    /// Whether a device has a standing policy rule pinned to its hash.
     pub fn has_standing_rule(&self, device: &Device) -> bool {
-        self.known_hashes_loaded
-            && !device.hash.is_empty()
-            && self.known_hashes.contains(&device.hash)
+        self.standing_target(device).is_some()
+    }
+
+    /// Whether the standing rule contradicts the device's live authorisation.
+    ///
+    /// This is the state a one-off decision leaves behind: the device is
+    /// allowed (or blocked) now, and the rule will undo that on the next
+    /// replug. Worth saying out loud rather than letting the user find out.
+    pub fn standing_rule_conflicts(&self, device: &Device) -> Option<Target> {
+        let standing = self.standing_target(device)?;
+        (device.is_connected() && standing != device.target).then_some(standing)
     }
 
     /// Journal entries matching the current filter, newest first.
@@ -237,7 +415,7 @@ impl State {
             .devices
             .iter()
             .filter(|device| self.needs_decision(device))
-            .map(|device| device.id)
+            .filter_map(Device::daemon_id)
             .collect();
 
         let mut effects = Vec::new();
@@ -280,7 +458,8 @@ impl State {
         // The device list is no longer current. Keeping it on screen would
         // present stale authorisations as live ones.
         self.devices.clear();
-        self.known_hashes_loaded = false;
+        self.policy_devices.clear();
+        self.standing_loaded = false;
 
         // Withdraw prompts we can no longer act on.
         let effects = self.retain_pending(|_, _| false);
@@ -293,12 +472,15 @@ impl State {
 
         match event {
             PresenceEvent::Remove => {
-                self.devices.retain(|d| d.id != device.id);
-                if self.selected == Some(device.id) {
+                let key = device.key();
+                self.devices.retain(|d| d.key() != key);
+                if self.selected.as_ref() == Some(&key) {
                     self.selected = None;
                 }
-                self.busy.remove(&device.id);
-                effects.extend(self.retain_pending(|_, p| p.device_id != device.id));
+                self.busy.remove(&key);
+                // So the hook runs again the next time it is plugged in.
+                self.hooks_fired.remove(&device.hash);
+                effects.extend(self.retain_pending(|_, p| Some(p.device_id) != device.daemon_id()));
                 self.record(Entry::device(Kind::Removed, Actor::Policy, &device));
                 return effects;
             }
@@ -317,10 +499,35 @@ impl State {
         };
         self.record(Entry::device(kind, Actor::Policy, &device));
 
-        if event == PresenceEvent::Insert && self.needs_decision(&device) {
-            if !self.is_pending(device.id) {
+        // A hook belongs to a device that is already authorised, so an insert
+        // that arrives allowed — because a standing rule allowed it — is the
+        // moment to run it.
+        effects.extend(self.hook_effect(&device));
+
+        // A device with a standing block or reject rule is refused without
+        // anyone being asked, which from the user's side looks like the device
+        // simply not working. Nothing else would ever mention it.
+        if event == PresenceEvent::Insert
+            && let Some(id) = device.daemon_id()
+            && !self.needs_decision(&device)
+            && device.target != Target::Allow
+            && !self.is_internal(&device)
+            && !device.is_root_hub()
+            && self.config.settings.notify_on_auto_block
+        {
+            debug_log!(
+                crate::debug::DEVICE,
+                "device {id} was refused by policy without a prompt"
+            );
+            effects.push(Effect::NotifyAutoBlocked(id));
+        }
+
+        if let (PresenceEvent::Insert, Some(id)) = (event, device.daemon_id())
+            && self.needs_decision(&device)
+        {
+            if !self.is_pending(id) {
                 self.pending.push(Pending {
-                    device_id: device.id,
+                    device_id: id,
                     live: true,
                     notification_id: None,
                 });
@@ -328,17 +535,16 @@ impl State {
 
             if self.config.settings.prompt_on_insert {
                 if self.config.settings.notify_on_insert {
-                    effects.push(Effect::Notify(device.id));
+                    effects.push(Effect::Notify(id));
                 }
                 if self.config.settings.auto_open_popup {
-                    effects.push(Effect::OpenPopup);
+                    effects.push(Effect::ShowWindow);
                 }
             }
 
             debug_log!(
                 crate::debug::DEVICE,
-                "device {} inserted and needs a decision",
-                device.id
+                "device {id} inserted and needs a decision"
             );
         }
 
@@ -347,7 +553,7 @@ impl State {
 
     fn on_policy(&mut self, device: Device, old: Target, new: Target) -> Vec<Effect> {
         self.upsert(device.clone());
-        self.busy.remove(&device.id);
+        self.busy.remove(&device.key());
 
         if old == new {
             return Vec::new();
@@ -365,9 +571,75 @@ impl State {
 
         let mut effects = Vec::new();
         if new == Target::Allow {
-            effects.extend(self.retain_pending(|_, p| p.device_id != device.id));
+            effects.extend(self.retain_pending(|_, p| Some(p.device_id) != device.daemon_id()));
+            effects.extend(self.hook_effect(&device));
+        } else if self.config.settings.notify_on_auto_block
+            && !self.is_internal(&device)
+            && !device.is_root_hub()
+            && let Some(id) = device.daemon_id()
+        {
+            // Something de-authorised a device that was working. The user did
+            // not do it here, or this would have been journalled as their own.
+            effects.push(Effect::NotifyAutoBlocked(id));
         }
         effects
+    }
+
+    /// Whether `device` should run its hook now, marking it as run if so.
+    ///
+    /// The authorisation requirement is enforced again in [`crate::hooks::run`];
+    /// this only decides *when* to ask, and stops one plug from running the
+    /// hook twice because both an insert and a policy signal described it.
+    fn hook_effect(&mut self, device: &Device) -> Option<Effect> {
+        let id = device.daemon_id()?;
+        if device.target != Target::Allow || device.hash.is_empty() {
+            return None;
+        }
+        let hook = self.config.settings.hook(&device.hash)?;
+        if !hook.enabled || hook.program.as_os_str().is_empty() {
+            return None;
+        }
+        if !self.hooks_fired.insert(device.hash.clone()) {
+            return None;
+        }
+        debug_log!(crate::debug::HOOK, "queueing hook for device {id}");
+        Some(Effect::RunHook(id))
+    }
+
+    /// Begin editing a device's hook.
+    pub fn begin_hook(&mut self, hash: String) {
+        let existing = self.config.settings.hook(&hash).cloned();
+        self.hook_draft = Some(HookDraft::new(hash, existing.as_ref()));
+    }
+
+    /// Save the draft, if there is one.
+    pub fn save_hook(&mut self) {
+        let Some(draft) = self.hook_draft.take() else {
+            return;
+        };
+        let hook = draft.to_hook();
+        self.set_hook(draft.hash, Some(hook));
+    }
+
+    /// Replace a device's hook, or remove it when `hook` is `None`.
+    pub fn set_hook(&mut self, hash: String, hook: Option<crate::hooks::Hook>) {
+        if hash.is_empty() {
+            return;
+        }
+        self.config.update(|settings| {
+            settings.hooks.retain(|h| h.hash != hash);
+            if let Some(hook) = hook {
+                settings.hooks.push(hook);
+            }
+        });
+        // Let a newly saved hook run for a device that is already plugged in,
+        // rather than making the user unplug it to test what they just set up.
+        self.hooks_fired.remove(&hash);
+    }
+
+    /// The hook configured for a device, if any.
+    pub fn hook(&self, device: &Device) -> Option<&crate::hooks::Hook> {
+        self.config.settings.hook(&device.hash)
     }
 
     /// Record a decision this app made.
@@ -426,10 +698,51 @@ impl State {
         self.health_checked = true;
     }
 
-    /// Replace the set of hashes that have standing policy rules.
-    pub fn set_known_hashes(&mut self, hashes: HashSet<String>) {
-        self.known_hashes = hashes;
-        self.known_hashes_loaded = true;
+    /// Replace everything derived from the daemon's rule set.
+    pub fn set_policy(&mut self, rules: &[PolicyRule]) {
+        self.standing = standing_targets(rules);
+        self.standing_loaded = true;
+        self.policy_devices = remembered_devices(rules);
+        debug_log!(
+            crate::debug::POLICY,
+            "policy: {} rule(s), {} pinned device(s)",
+            rules.len(),
+            self.policy_devices.len()
+        );
+    }
+
+    /// Mark a device as part of this machine, or unmark it.
+    ///
+    /// Marking is a display and prompting preference, never an authorisation:
+    /// an internal device stays exactly as USBGuard has it until the user
+    /// allows it explicitly. What it does change is that the app stops asking
+    /// about it on every boot, which is the whole reason for the mark.
+    ///
+    /// Returns the effects of withdrawing any prompt already raised for it, so
+    /// marking something internal takes its notification down with it.
+    pub fn set_internal(&mut self, hash: String, internal: bool) -> Vec<Effect> {
+        if hash.is_empty() {
+            return Vec::new();
+        }
+
+        self.config.update(|settings| {
+            settings.internal_hashes.retain(|h| h != &hash);
+            if internal {
+                settings.internal_hashes.push(hash.clone());
+            }
+        });
+
+        if !internal {
+            return Vec::new();
+        }
+
+        let marked: Vec<u32> = self
+            .devices
+            .iter()
+            .filter(|d| d.hash == hash)
+            .filter_map(Device::daemon_id)
+            .collect();
+        self.retain_pending(|_, p| !marked.contains(&p.device_id))
     }
 
     /// Apply and persist a settings change.
@@ -465,11 +778,12 @@ impl State {
         device.target != Target::Allow
             && !device.is_root_hub()
             && !device.is_hardwired()
+            && !self.is_internal(device)
             && !self.has_standing_rule(device)
     }
 
     fn upsert(&mut self, device: Device) {
-        match self.devices.iter_mut().find(|d| d.id == device.id) {
+        match self.devices.iter_mut().find(|d| d.key() == device.key()) {
             Some(existing) => *existing = device,
             None => self.devices.push(device),
         }
@@ -500,7 +814,7 @@ impl State {
 
 /// Sort key: prompts first, then blocked devices, then everything else.
 fn sort_rank(state: &State, device: &Device) -> u8 {
-    if state.is_pending(device.id) {
+    if device.daemon_id().is_some_and(|id| state.is_pending(id)) {
         0
     } else if device.target != Target::Allow {
         1
@@ -509,12 +823,35 @@ fn sort_rank(state: &State, device: &Device) -> u8 {
     }
 }
 
-/// Collect the hashes of every rule in a policy listing.
-pub fn hashes_from_rules(rules: &[crate::usbguard::PolicyRule]) -> HashSet<String> {
+/// What the policy does to each device hash it pins a rule to.
+///
+/// The *first* rule wins, not the last. `usbguard-rules.conf(5)`: "the daemon
+/// scans the existing rules sequentially. If a matching rule is found, it
+/// either authorizes (allows), deauthorizes (blocks) or removes (rejects) the
+/// device". Folding later rules over earlier ones would report the opposite of
+/// what the daemon will actually do whenever a policy holds two rules for one
+/// device.
+pub fn standing_targets(rules: &[PolicyRule]) -> HashMap<String, Target> {
+    let mut targets = HashMap::new();
+    for rule in rules {
+        if let Some(hash) = rule.hash() {
+            targets.entry(hash.to_string()).or_insert(rule.rule.target);
+        }
+    }
+    targets
+}
+
+/// The devices a policy listing pins rules to, one entry per device.
+///
+/// Only the first rule for a given hash becomes an entry, for the same reason
+/// [`standing_targets`] keeps the first: that is the rule the daemon will act
+/// on, so it is the one the user needs to see and be able to change.
+pub fn remembered_devices(rules: &[PolicyRule]) -> Vec<Device> {
+    let mut seen = HashSet::new();
     rules
         .iter()
-        .filter_map(|rule| rule.hash())
-        .map(str::to_string)
+        .filter_map(PolicyRule::device)
+        .filter(|device| seen.insert(device.hash.clone()))
         .collect()
 }
 
@@ -549,6 +886,7 @@ mod tests {
             connected: false,
             disconnect_reason: String::new(),
             devices: Vec::new(),
+            policy_devices: Vec::new(),
             health: Health::default(),
             health_checked: false,
             pending: Vec::new(),
@@ -558,8 +896,10 @@ mod tests {
             error: None,
             history: Vec::new(),
             history_filter: HistoryFilter::default(),
-            known_hashes: HashSet::new(),
-            known_hashes_loaded: false,
+            hook_draft: None,
+            hooks_fired: HashSet::new(),
+            standing: HashMap::new(),
+            standing_loaded: false,
         };
         // Keep tests off the real journal file.
         state.config.settings.journal_enabled = false;
@@ -578,7 +918,7 @@ mod tests {
 
         assert!(state.is_pending(1));
         assert!(effects.contains(&Effect::Notify(1)));
-        assert!(effects.contains(&Effect::OpenPopup));
+        assert!(effects.contains(&Effect::ShowWindow));
     }
 
     #[test]
@@ -604,7 +944,7 @@ mod tests {
         assert!(state.is_pending(1));
         assert!(!state.is_pending(2));
         assert!(!effects.iter().any(|e| matches!(e, Effect::Notify(_))));
-        assert!(!effects.contains(&Effect::OpenPopup));
+        assert!(!effects.contains(&Effect::ShowWindow));
         assert!(!state.pending[0].live);
     }
 
@@ -622,10 +962,19 @@ mod tests {
         assert!(state.pending.is_empty());
     }
 
+    /// A policy listing built from rule text, the way `listRules` returns it.
+    fn policy(rules: &[&str]) -> Vec<PolicyRule> {
+        rules
+            .iter()
+            .enumerate()
+            .map(|(i, text)| PolicyRule::from_pair(i as u32, text).unwrap())
+            .collect()
+    }
+
     #[test]
     fn a_device_with_a_standing_rule_is_not_prompted_about() {
         let mut state = state();
-        state.set_known_hashes(HashSet::from(["H1=".to_string()]));
+        state.set_policy(&policy(&[r#"allow hash "H1=""#]));
         state.apply_event(Event::Connected {
             devices: vec![device(1, "block", "")],
         });
@@ -634,7 +983,7 @@ mod tests {
 
     #[test]
     fn an_unreadable_policy_fails_towards_asking() {
-        // known_hashes was never loaded, so nothing counts as known and the
+        // The policy was never loaded, so nothing counts as known and the
         // user still gets asked.
         let mut state = state();
         state.apply_event(Event::Connected {
@@ -764,7 +1113,11 @@ mod tests {
             event: PresenceEvent::Insert,
         });
 
-        let order: Vec<u32> = state.visible_devices().iter().map(|d| d.id).collect();
+        let order: Vec<u32> = state
+            .visible_devices()
+            .iter()
+            .filter_map(|d| d.daemon_id())
+            .collect();
         // 1 and 2 are both pending (1 from startup, 2 live); 3 is allowed.
         assert_eq!(order.last(), Some(&3));
         assert!(order[..2].contains(&1) && order[..2].contains(&2));
@@ -866,15 +1219,319 @@ mod tests {
     }
 
     #[test]
-    fn hashes_are_collected_from_policy_rules() {
-        let rules = vec![
-            crate::usbguard::PolicyRule::from_pair(0, r#"allow hash "AAA=""#).unwrap(),
-            crate::usbguard::PolicyRule::from_pair(1, r#"block id 1234:5678"#).unwrap(),
-            crate::usbguard::PolicyRule::from_pair(2, r#"reject hash "BBB=""#).unwrap(),
-        ];
-        let hashes = hashes_from_rules(&rules);
-        assert_eq!(hashes.len(), 2);
-        assert!(hashes.contains("AAA="));
-        assert!(hashes.contains("BBB="));
+    fn a_silently_refused_device_is_announced() {
+        // The gap this closes: a device with a standing block rule is never
+        // prompted about, so without this nothing on screen explains why the
+        // drive did not appear.
+        let mut state = state();
+        state.apply_event(Event::Connected { devices: vec![] });
+        state.set_policy(&policy(&[r#"block hash "H1=""#]));
+
+        let effects = state.apply_event(Event::Presence {
+            device: device(1, "block", ""),
+            event: PresenceEvent::Insert,
+        });
+
+        assert!(!state.is_pending(1), "a standing rule means no prompt");
+        assert!(
+            effects.contains(&Effect::NotifyAutoBlocked(1)),
+            "the refusal must be reported: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn a_device_awaiting_a_decision_is_not_reported_as_auto_blocked() {
+        // It gets a prompt, which says everything the notification would.
+        let mut state = state();
+        state.apply_event(Event::Connected { devices: vec![] });
+        let effects = state.apply_event(Event::Presence {
+            device: device(1, "block", ""),
+            event: PresenceEvent::Insert,
+        });
+        assert!(state.is_pending(1));
+        assert!(
+            !effects.contains(&Effect::NotifyAutoBlocked(1)),
+            "{effects:?}"
+        );
+    }
+
+    #[test]
+    fn an_internal_device_is_never_announced_as_refused() {
+        // The point of marking something internal is to stop hearing about it.
+        let mut state = state();
+        state.apply_event(Event::Connected { devices: vec![] });
+        state.set_policy(&policy(&[r#"block hash "H1=""#]));
+        state.set_internal("H1=".to_string(), true);
+
+        let effects = state.apply_event(Event::Presence {
+            device: device(1, "block", ""),
+            event: PresenceEvent::Insert,
+        });
+        assert!(
+            !effects.contains(&Effect::NotifyAutoBlocked(1)),
+            "{effects:?}"
+        );
+    }
+
+    #[test]
+    fn a_hook_runs_once_per_plug_and_only_when_allowed() {
+        let mut state = state();
+        state.set_hook(
+            "H1=".to_string(),
+            Some(crate::hooks::Hook {
+                hash: "H1=".to_string(),
+                program: std::path::PathBuf::from("/bin/true"),
+                args: Vec::new(),
+                enabled: true,
+                label: "Backup".to_string(),
+            }),
+        );
+        state.apply_event(Event::Connected { devices: vec![] });
+
+        // Blocked: nothing runs.
+        let blocked = state.apply_event(Event::Presence {
+            device: device(1, "block", ""),
+            event: PresenceEvent::Insert,
+        });
+        assert!(!blocked.contains(&Effect::RunHook(1)), "{blocked:?}");
+
+        // Allowed: runs once.
+        let allowed = state.apply_event(Event::Policy {
+            device: device(1, "allow", ""),
+            old: Target::Block,
+            new: Target::Allow,
+            rule_id: 0,
+        });
+        assert!(allowed.contains(&Effect::RunHook(1)), "{allowed:?}");
+
+        // A second signal describing the same device must not run it again.
+        let repeat = state.apply_event(Event::Presence {
+            device: device(1, "allow", ""),
+            event: PresenceEvent::Update,
+        });
+        assert!(!repeat.contains(&Effect::RunHook(1)), "{repeat:?}");
+
+        // Unplugging resets it, so the next plug runs the hook again.
+        state.apply_event(Event::Presence {
+            device: device(1, "allow", ""),
+            event: PresenceEvent::Remove,
+        });
+        let replug = state.apply_event(Event::Presence {
+            device: device(1, "allow", ""),
+            event: PresenceEvent::Insert,
+        });
+        assert!(replug.contains(&Effect::RunHook(1)), "{replug:?}");
+    }
+
+    #[test]
+    fn a_device_with_no_hook_never_asks_to_run_one() {
+        let mut state = state();
+        let effects = state.apply_event(Event::Presence {
+            device: device(1, "allow", ""),
+            event: PresenceEvent::Insert,
+        });
+        assert!(
+            !effects.iter().any(|e| matches!(e, Effect::RunHook(_))),
+            "{effects:?}"
+        );
+    }
+
+    #[test]
+    fn standing_targets_are_collected_from_policy_rules() {
+        let rules = policy(&[
+            r#"allow hash "AAA=""#,
+            r#"block id 1234:5678"#,
+            r#"reject hash "BBB=""#,
+        ]);
+        let targets = standing_targets(&rules);
+        // The `id`-only rule is not pinned to a device and has no hash to key
+        // on, so it contributes nothing.
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets.get("AAA="), Some(&Target::Allow));
+        assert_eq!(targets.get("BBB="), Some(&Target::Reject));
+    }
+
+    #[test]
+    fn the_first_matching_rule_wins_not_the_last() {
+        // usbguard-rules.conf(5): the daemon "scans the existing rules
+        // sequentially" and acts on the first match. Reporting the last one
+        // would tell the user the opposite of what will happen, and would make
+        // the Allow button look like it had worked when it had not.
+        let rules = policy(&[r#"reject hash "AAA=""#, r#"allow hash "AAA=""#]);
+        assert_eq!(standing_targets(&rules).get("AAA="), Some(&Target::Reject));
+    }
+
+    #[test]
+    fn a_permanently_rejected_device_is_still_reachable_once_unplugged() {
+        // The case this was built for: a decision made in the prompt outlives
+        // the device being connected, so without a row for it there is no way
+        // back. The rule text is a real one, as USBGuard wrote it.
+        const SANDISK: &str = concat!(
+            r#"reject id 0781:55a9 serial "00002931052124091945" "#,
+            r#"name " SanDisk 3.2Gen1" hash "ifdabAPA9pgbVCvjqyUPQSihHiNCta+T9OWu2HOXKJQ=" "#,
+            r#"with-interface { 08:06:50 08:06:62 } with-connect-type "hotplug""#
+        );
+
+        let mut state = state();
+        state.apply_event(Event::Connected { devices: vec![] });
+        state.set_policy(&policy(&[SANDISK]));
+
+        let remembered = state.remembered_devices();
+        assert_eq!(
+            remembered.len(),
+            1,
+            "the rejected device must still be listed"
+        );
+
+        let device = remembered[0];
+        assert_eq!(device.display_name(), " SanDisk 3.2Gen1");
+        assert!(!device.is_connected());
+        assert_eq!(
+            device.daemon_id(),
+            None,
+            "an unplugged device must not carry an ID that applyDevicePolicy could act on"
+        );
+        assert_eq!(state.standing_target(device), Some(Target::Reject));
+
+        // And the rule it would be replaced with is still pinned to the hash,
+        // so undoing the mistake cannot widen it to every SanDisk.
+        let rule = device.retargeted_rule(Target::Allow).unwrap();
+        assert!(rule.starts_with("allow "), "{rule}");
+        assert!(rule.contains(r#"hash "ifdabAPA9pgbVCvjqyUPQSihHiNCta+T9OWu2HOXKJQ=""#));
+        assert!(!rule.contains("reject"));
+    }
+
+    #[test]
+    fn the_hidden_count_matches_what_the_lists_actually_drop() {
+        let mut state = state();
+        state.apply_event(Event::Connected {
+            devices: vec![device(1, "allow", "")],
+        });
+        state.set_policy(&policy(&[r#"block hash "GONE=""#]));
+
+        // Shown: nothing is hidden.
+        assert_eq!(state.remembered_devices().len(), 1);
+        assert_eq!(state.hidden_count(), 0);
+
+        // Turned off: the whole section is hidden and has to be counted, or
+        // the caption tells the user about fewer devices than it is hiding.
+        state.config.settings.show_disconnected = false;
+        assert!(state.remembered_devices().is_empty());
+        assert_eq!(state.hidden_count(), 1);
+    }
+
+    #[test]
+    fn a_connected_device_is_not_also_listed_as_disconnected() {
+        // The device list and the policy are read separately; a device that
+        // arrives between the two reads must not appear twice.
+        let mut state = state();
+        state.apply_event(Event::Connected {
+            devices: vec![device(1, "allow", "")],
+        });
+        state.set_policy(&policy(&[r#"allow hash "H1=""#, r#"block hash "GONE=""#]));
+
+        let remembered = state.remembered_devices();
+        assert_eq!(remembered.len(), 1);
+        assert_eq!(remembered[0].hash, "GONE=");
+    }
+
+    #[test]
+    fn marking_a_device_internal_stops_it_being_asked_about_and_listed() {
+        let mut state = state();
+        state.apply_event(Event::Connected { devices: vec![] });
+        state.apply_event(Event::Presence {
+            device: device(1, "block", ""),
+            event: PresenceEvent::Insert,
+        });
+        assert!(
+            state.is_pending(1),
+            "precondition: it should be asked about"
+        );
+
+        // Marking withdraws the outstanding question as well as hiding it;
+        // leaving a prompt up for something the user just called internal
+        // would be the nagging the mark exists to stop.
+        state.set_internal("H1=".to_string(), true);
+        assert!(!state.is_pending(1));
+        assert!(state.is_internal(&device(1, "block", "")));
+        assert!(!state.is_visible(&device(1, "block", "")));
+
+        // But it is still only a display and prompting preference: the device
+        // is untouched, and turning the setting on shows it again.
+        state.config.settings.show_internal = true;
+        assert!(state.is_visible(&device(1, "block", "")));
+    }
+
+    #[test]
+    fn an_internal_mark_does_not_authorise_anything() {
+        // The mark must never be a back door to allowing a device. Nothing in
+        // `set_internal` may change a target.
+        let mut state = state();
+        state.apply_event(Event::Connected {
+            devices: vec![device(1, "block", "")],
+        });
+        state.set_internal("H1=".to_string(), true);
+        assert_eq!(state.devices[0].target, Target::Block);
+    }
+
+    #[test]
+    fn an_internal_mark_is_pinned_to_the_hash_not_the_usb_id() {
+        // A mark that followed the USB ID would be inherited by any device
+        // claiming the same vendor and product, which is exactly the spoofing
+        // this app exists to catch.
+        let mut state = state();
+        state.set_internal("H1=".to_string(), true);
+
+        let impostor = Device::from_rule(
+            9,
+            r#"block id 0781:5561 name "Device 1" hash "DIFFERENT=" with-connect-type "hotplug""#,
+        )
+        .unwrap();
+        assert!(!state.is_internal(&impostor));
+    }
+
+    #[test]
+    fn a_device_with_no_hash_cannot_be_marked_internal() {
+        // There is nothing durable to key the mark on, so it must be refused
+        // rather than stored against an empty string and matching everything.
+        let mut state = state();
+        state.set_internal(String::new(), true);
+        assert!(state.config.settings.internal_hashes.is_empty());
+
+        let hashless = Device::from_rule(1, r#"block id 1234:5678"#).unwrap();
+        assert!(!state.is_internal(&hashless));
+    }
+
+    #[test]
+    fn a_conflicting_standing_rule_is_reported() {
+        // A one-off allow leaves a device working now and blocked on the next
+        // replug. The UI has to be able to say so.
+        let mut state = state();
+        state.apply_event(Event::Connected {
+            devices: vec![device(1, "allow", "")],
+        });
+        state.set_policy(&policy(&[r#"block hash "H1=""#]));
+
+        let device = state.device(1).unwrap();
+        assert_eq!(state.standing_rule_conflicts(device), Some(Target::Block));
+
+        // Agreement is not a conflict.
+        state.set_policy(&policy(&[r#"allow hash "H1=""#]));
+        assert_eq!(
+            state.standing_rule_conflicts(state.device(1).unwrap()),
+            None
+        );
+    }
+
+    #[test]
+    fn device_keys_from_the_two_sources_never_collide() {
+        // Daemon device IDs and rule IDs are both small integers. If these
+        // ever compared equal, clicking a remembered device would act on
+        // whichever connected device happened to share the number.
+        let connected = device(1, "block", "");
+        let remembered = Device::remembered(r#"block hash "H1=""#).unwrap();
+        assert_ne!(connected.key(), remembered.key());
+        assert_eq!(connected.key(), DeviceKey::Connected(1));
+        assert_eq!(remembered.key(), DeviceKey::Remembered("H1=".to_string()));
     }
 }

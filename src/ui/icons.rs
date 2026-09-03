@@ -18,7 +18,11 @@ pub const INPUT: &str = "input-keyboard-symbolic";
 /// Network adapter.
 pub const NETWORK: &str = "network-wired-symbolic";
 /// Audio device.
-pub const AUDIO: &str = "audio-card-usb-symbolic";
+///
+/// `audio-card-usb-symbolic` would be the more specific name, but it exists
+/// only in some themes — including Pop!_OS's, which is how it survived local
+/// testing and was caught by CI against stock Adwaita.
+pub const AUDIO: &str = "audio-card-symbolic";
 /// Camera or scanner.
 pub const CAMERA: &str = "camera-web-symbolic";
 /// Printer.
@@ -40,6 +44,14 @@ pub const REMOVE: &str = "list-remove-symbolic";
 pub const COPY: &str = "edit-copy-symbolic";
 /// Reload.
 pub const REFRESH: &str = "view-refresh-symbolic";
+/// Quit, in the tray menu.
+pub const QUIT: &str = "application-exit-symbolic";
+/// A configured hook program.
+pub const HOOK: &str = "system-run-symbolic";
+/// The decision history.
+pub const HISTORY: &str = "document-open-recent-symbolic";
+/// Application settings.
+pub const SETTINGS: &str = "preferences-system-symbolic";
 
 /// Panel icon: protecting, nothing outstanding.
 pub const PANEL_OK: &str = "security-high-symbolic";
@@ -81,10 +93,19 @@ pub fn for_device(device: &Device) -> &'static str {
 /// decision outranks a healthy install: the user needs to act either way, and
 /// showing the calm icon while a device sits blocked would be misleading.
 pub fn for_status(connected: bool, health: &Health, pending: usize) -> &'static str {
+    for_severity_status(connected, health.worst(), pending)
+}
+
+/// The indicator icon for an already-reduced severity.
+///
+/// The tray carries a [`Severity`] rather than a whole [`Health`], and having
+/// it re-implement the ranking would be a second copy of these rules that
+/// could drift from the panel's.
+pub fn for_severity_status(connected: bool, severity: Severity, pending: usize) -> &'static str {
     if !connected {
         return PANEL_CRITICAL;
     }
-    match health.worst() {
+    match severity {
         Severity::Critical => PANEL_CRITICAL,
         Severity::Warning => PANEL_WARNING,
         Severity::Ok if pending > 0 => PANEL_WARNING,

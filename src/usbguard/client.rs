@@ -100,6 +100,42 @@ fn classify_method_error(name: &str, message: String) -> Error {
     }
 }
 
+/// Make a call that changes policy, allowing an authentication prompt.
+///
+/// The D-Bus `ALLOW_INTERACTIVE_AUTHORIZATION` flag is opt-in, and without it
+/// a Polkit action marked `auth_admin` comes straight back as `AccessDenied`
+/// with no dialog shown — the user clicks a button and nothing happens. That
+/// is not hypothetical: the polkit rules Debian and Ubuntu ship for USBGuard
+/// grant `appendRule` and `applyDevicePolicy` to the `sudo` and `plugdev`
+/// groups but leave `removeRule` at `auth_admin`, so on a stock install every
+/// rule removal takes this path.
+///
+/// Only mutating calls get the flag. The read calls are made on a timer, and
+/// a timer that can raise password prompts is a good way to train someone to
+/// type their password into whatever asks.
+async fn call_interactive<'a, B, R>(
+    proxy: &zbus::Proxy<'a>,
+    method: &str,
+    body: &B,
+) -> Result<R, Error>
+where
+    B: serde::ser::Serialize + zbus::zvariant::DynamicType,
+    R: for<'d> zbus::zvariant::DynamicDeserialize<'d>,
+{
+    let call = proxy.call_with_flags::<_, _, R>(
+        method,
+        zbus::proxy::MethodFlags::AllowInteractiveAuth.into(),
+        body,
+    );
+    match tokio::time::timeout(DBUS_CALL_TIMEOUT, call).await {
+        Err(_) => Err(Error::Timeout),
+        Ok(Err(e)) => Err(classify(e)),
+        // `None` only comes back for a no-reply call, which none of these are.
+        Ok(Ok(None)) => Err(Error::Dbus(format!("{method} returned no reply"))),
+        Ok(Ok(Some(value))) => Ok(value),
+    }
+}
+
 /// Await a D-Bus call with an upper bound on how long it may block.
 ///
 /// Calls are Polkit-mediated, so a slow reply usually means an authentication
@@ -211,9 +247,10 @@ impl Client {
             crate::debug::DEVICE,
             "applyDevicePolicy id={id} target={target} permanent={permanent}"
         );
-        with_timeout(
-            self.devices
-                .apply_device_policy(id, target.to_dbus(), permanent),
+        call_interactive(
+            self.devices.inner(),
+            "applyDevicePolicy",
+            &(id, target.to_dbus(), permanent),
         )
         .await
     }
@@ -249,13 +286,18 @@ impl Client {
             "appendRule temporary={temporary}: {rule}"
         );
         // `u32::MAX` is USBGuard's "append at the end" sentinel.
-        with_timeout(self.policy.append_rule(rule, u32::MAX, temporary)).await
+        call_interactive(
+            self.policy.inner(),
+            "appendRule",
+            &(rule, u32::MAX, temporary),
+        )
+        .await
     }
 
     /// Remove a rule from the policy.
     pub async fn remove_rule(&self, id: u32) -> Result<(), Error> {
         debug_log!(crate::debug::POLICY, "removeRule id={id}");
-        with_timeout(self.policy.remove_rule(id)).await
+        call_interactive(self.policy.inner(), "removeRule", &(id,)).await
     }
 
     /// Read a daemon runtime parameter.
@@ -266,7 +308,7 @@ impl Client {
     /// Set a daemon runtime parameter, returning the previous value.
     pub async fn set_parameter(&self, name: &str, value: &str) -> Result<String, Error> {
         debug_log!(crate::debug::POLICY, "setParameter {name}={value}");
-        with_timeout(self.root.set_parameter(name, value)).await
+        call_interactive(self.root.inner(), "setParameter", &(name, value)).await
     }
 
     /// Remove every policy rule pinned to the given device hash.

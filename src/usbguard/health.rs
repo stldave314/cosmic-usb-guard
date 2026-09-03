@@ -11,6 +11,8 @@
 //! empty, or `InsertedDevicePolicy` can be set to `allow`, which authorises
 //! every new device before anyone can be asked about it.
 
+use std::collections::HashMap;
+
 use crate::constants::{
     INSERTED_POLICY_PREFERRED, INSERTED_POLICY_UNSAFE, PARAM_INSERTED_DEVICE_POLICY, UNIT_DAEMON,
     UNIT_DBUS,
@@ -18,7 +20,7 @@ use crate::constants::{
 use crate::debug_log;
 
 use super::client::{Client, Error};
-use super::proxy::SystemdProxy;
+use super::proxy::{PolkitProxy, SystemdProxy};
 
 /// How badly a failed check compromises protection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -49,6 +51,8 @@ pub enum CheckId {
     IpcReachable,
     /// This user is permitted to make policy decisions.
     IpcPermission,
+    /// This user is permitted to *undo* one.
+    DecisionsReversible,
     /// New devices are held for a decision rather than auto-authorised.
     InsertedDevicePolicy,
     /// The policy is not empty.
@@ -201,6 +205,75 @@ fn check_unit_enabled(id: CheckId, unit: &str, state: &UnitState) -> Check {
     }
 }
 
+/// Polkit action guarding rule removal, which is what undoing a decision needs.
+const ACTION_REMOVE_RULE: &str = "org.usbguard.Policy1.removeRule";
+
+/// Whether this session may remove a policy rule.
+///
+/// Asked of Polkit rather than of USBGuard, because there is no harmless way
+/// to ask USBGuard: `removeRule` takes a rule ID and deletes it, so probing
+/// with the real call would mean deleting one of the user's rules to find out
+/// whether deleting rules is allowed.
+///
+/// `flags` is 0 — no user interaction — so this check never raises a dialog of
+/// its own. The three outcomes are genuinely different and are reported as
+/// such: allowed outright, allowed after authenticating, and refused.
+async fn check_decisions_reversible(connection: &zbus::Connection) -> Check {
+    let Some(name) = connection.unique_name() else {
+        return Check::warn(CheckId::DecisionsReversible, "unknown", None);
+    };
+
+    let polkit = match PolkitProxy::new(connection).await {
+        Ok(polkit) => polkit,
+        // No Polkit at all: nothing to report, since the daemon's own
+        // authorisation is then whatever it is and `IpcPermission` covers it.
+        Err(_) => return Check::warn(CheckId::DecisionsReversible, "polkit unavailable", None),
+    };
+
+    let subject = (
+        "system-bus-name",
+        HashMap::from([("name", zbus::zvariant::Value::from(name.as_str()))]),
+    );
+
+    match polkit
+        .check_authorization(&subject, ACTION_REMOVE_RULE, HashMap::new(), 0, "")
+        .await
+    {
+        Ok((true, _, _)) => Check::ok(CheckId::DecisionsReversible, "granted"),
+        // Permitted, but every removal will ask for an administrator password.
+        // Workable, so a warning rather than a failure.
+        Ok((false, true, _)) => Check::warn(
+            CheckId::DecisionsReversible,
+            "requires an administrator password",
+            Some(POLKIT_REMEDY.to_string()),
+        ),
+        Ok((false, false, _)) => Check::critical(
+            CheckId::DecisionsReversible,
+            "refused",
+            Some(POLKIT_REMEDY.to_string()),
+        ),
+        Err(e) => Check::warn(CheckId::DecisionsReversible, e.to_string(), None),
+    }
+}
+
+/// Shell command that grants rule removal to the same groups the distribution
+/// already trusts with rule *creation*.
+///
+/// Written as a drop-in file rather than an edit to the packaged rules, so a
+/// package upgrade cannot silently revert it and nothing already there is
+/// disturbed. `50-` sorts before the shipped `org.usbguard1.rules`; Polkit
+/// takes the first rule that returns a result.
+const POLKIT_REMEDY: &str = concat!(
+    "sudo tee /etc/polkit-1/rules.d/50-usbguard-remove-rule.rules >/dev/null <<'EOF'\n",
+    "polkit.addRule(function(action, subject) {\n",
+    "    if (action.id == \"org.usbguard.Policy1.removeRule\" &&\n",
+    "        subject.active && subject.local &&\n",
+    "        (subject.isInGroup(\"plugdev\") || subject.isInGroup(\"sudo\"))) {\n",
+    "        return polkit.Result.YES;\n",
+    "    }\n",
+    "});\nEOF"
+);
+
 /// Run every check against the running system.
 ///
 /// `client` may be `None` when a connection could not be established at all;
@@ -286,6 +359,12 @@ pub async fn evaluate(client: Option<&Client>, connection: Option<&zbus::Connect
             )),
         )),
         Err(e) => checks.push(Check::warn(CheckId::IpcPermission, e.to_string(), None)),
+    }
+
+    // Whether a decision can be taken back is part of whether this app works
+    // at all, and it is invisible until someone tries.
+    if let Some(connection) = connection {
+        checks.push(check_decisions_reversible(connection).await);
     }
 
     match client.list_rules().await {

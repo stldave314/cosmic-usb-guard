@@ -7,7 +7,7 @@
 //!
 //! Notifications are a convenience, never the mechanism: a device stays
 //! blocked whether or not the notification is seen, and every action they
-//! offer is also reachable from the applet and the main window.
+//! offer is also reachable from the main window.
 
 use std::collections::HashMap;
 
@@ -24,6 +24,8 @@ pub const ACTION_ALLOW: &str = "allow";
 pub const ACTION_BLOCK: &str = "block";
 /// Action key sent back when the user asks to see the details first.
 pub const ACTION_DETAILS: &str = "details";
+/// Action key sent back from a refusal notice, asking to manage the device.
+pub const ACTION_MANAGE: &str = "manage";
 
 /// A connection to the notification daemon.
 #[derive(Clone)]
@@ -98,6 +100,43 @@ impl Notifier {
             &actions,
             hints,
             NOTIFY_PROMPT_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    /// Tell the user a device was refused without them being asked.
+    ///
+    /// This is the case that is otherwise invisible: a device with a standing
+    /// block or reject rule never raises a prompt, so from the user's side the
+    /// drive simply does not appear and nothing says why. The notification
+    /// carries a single action that opens the window at that device, because
+    /// the answer to "why did that not work" is a thing they will want to
+    /// change, and hunting for the app first is friction at exactly the wrong
+    /// moment.
+    ///
+    /// Not urgent, and it expires on its own: unlike a pending decision, there
+    /// is nothing outstanding here — the device is already refused.
+    pub async fn auto_blocked(&self, device: &Device) -> Option<u32> {
+        let summary = crate::fl!("notify-auto-blocked");
+        let body = crate::fl!("notify-auto-blocked-body", name = device.display_name());
+
+        let category = Value::from("device.error");
+        let desktop_entry = Value::from(APP_ID);
+        let mut hints: HashMap<&str, &Value<'_>> = HashMap::new();
+        hints.insert("category", &category);
+        hints.insert("desktop-entry", &desktop_entry);
+
+        let manage = crate::fl!("notify-manage");
+        let actions = [ACTION_MANAGE, manage.as_str()];
+
+        self.send(
+            0,
+            "changes-prevent-symbolic",
+            &summary,
+            &body,
+            &actions,
+            hints,
+            NOTIFY_INFO_TIMEOUT_MS,
         )
         .await
     }
@@ -229,6 +268,15 @@ mod tests {
         // The keystroke-injection warning must be present, not merely implied
         // by the class name.
         assert!(body.lines().count() > 3, "missing warning line in: {body}");
+    }
+
+    #[test]
+    fn every_notification_action_key_is_distinct() {
+        // Two actions sharing a key would silently make one of them do the
+        // other's job — and one of these authorises a device.
+        let keys = [ACTION_ALLOW, ACTION_BLOCK, ACTION_DETAILS, ACTION_MANAGE];
+        let unique: std::collections::HashSet<_> = keys.iter().collect();
+        assert_eq!(unique.len(), keys.len(), "duplicate action key in {keys:?}");
     }
 
     #[test]

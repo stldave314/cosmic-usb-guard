@@ -33,13 +33,13 @@ pub fn issues_url() -> String {
 // ---------------------------------------------------------------------------
 
 /// Well-known bus name owned by `usbguard-dbus`.
+///
+/// Object paths and interface names are *not* mirrored here. `zbus::proxy`
+/// requires them as literals in its attributes, so a copy in this file could
+/// only ever be a second, silently divergent source of truth; see
+/// [`crate::usbguard::proxy`]. This one is here because the bus name is also
+/// needed for the `NameOwnerChanged` watch, which is not part of a proxy.
 pub const USBGUARD_BUS: &str = "org.usbguard1";
-/// Root object path.
-pub const PATH_ROOT: &str = "/org/usbguard1";
-/// Devices object path.
-pub const PATH_DEVICES: &str = "/org/usbguard1/Devices";
-/// Policy object path.
-pub const PATH_POLICY: &str = "/org/usbguard1/Policy";
 
 /// How long to wait for a single USBGuard D-Bus method call before giving up.
 ///
@@ -57,17 +57,16 @@ pub const RECONNECT_DELAY_MAX: Duration = Duration::from_secs(60);
 // Polling and refresh
 // ---------------------------------------------------------------------------
 
-/// Interval at which the health of the USBGuard installation is re-checked.
+/// Interval at which devices, policy and health are re-read.
 ///
 /// Health depends on systemd unit state and daemon parameters, neither of
-/// which emits a signal we can subscribe to, so it is polled.
-pub const HEALTH_POLL_INTERVAL: Duration = Duration::from_secs(15);
-
-/// Interval at which the device list is refreshed as a safety net.
+/// which emits a signal we can subscribe to, so it has to be polled. The
+/// device list is picked up separately from D-Bus signals; re-reading it on
+/// the same timer is a safety net for a signal missed across a daemon restart.
 ///
-/// The list is primarily kept current by D-Bus signals; this only catches the
-/// case where a signal was missed (for example across a daemon restart).
-pub const DEVICE_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+/// One timer rather than two: the refresh reads everything at once, so a
+/// second, faster timer would only duplicate the same Polkit-mediated calls.
+pub const REFRESH_INTERVAL: Duration = Duration::from_secs(20);
 
 // ---------------------------------------------------------------------------
 // Event journal
@@ -121,8 +120,11 @@ pub const DESCRIPTION_ELIDE_CHARS: usize = 64;
 // USBGuard daemon expectations
 // ---------------------------------------------------------------------------
 
-/// Path to the daemon configuration file.
-pub const DAEMON_CONF_PATH: &str = "/etc/usbguard/usbguard-daemon.conf";
+// The daemon's configuration file is deliberately not referenced. It is
+// root-readable only, and reading it would answer "what was configured"
+// rather than "what is in force" — which are different whenever the file has
+// been edited without a reload. Every check in `usbguard::health` asks the
+// running daemon instead.
 
 /// systemd unit that must be running for any of this to work.
 pub const UNIT_DAEMON: &str = "usbguard.service";

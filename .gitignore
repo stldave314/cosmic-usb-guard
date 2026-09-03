@@ -17,3 +17,7 @@
 
 # Left behind only if a verification script is interrupted
 src/debug.rs.orig
+
+# Python bytecode from the locale generator
+__pycache__/
+*.pyc

@@ -47,6 +47,10 @@ pub const CONFIG: &str = "CONFIG";
 pub const JOURNAL: &str = "JOURNAL";
 /// Desktop notifications.
 pub const NOTIFY: &str = "NOTIFY";
+/// Status icon lifecycle.
+pub const TRAY: &str = "TRAY";
+/// Per-device hook programs.
+pub const HOOK: &str = "HOOK";
 
 struct Sink {
     file: Option<File>,

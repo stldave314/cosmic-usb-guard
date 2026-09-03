@@ -56,6 +56,7 @@ pub fn check_label(id: CheckId) -> String {
         CheckId::DbusEnabled => fl!("check-dbus-enabled"),
         CheckId::IpcReachable => fl!("check-ipc-reachable"),
         CheckId::IpcPermission => fl!("check-ipc-permission"),
+        CheckId::DecisionsReversible => fl!("check-decisions-reversible"),
         CheckId::InsertedDevicePolicy => fl!("check-inserted-policy"),
         CheckId::PolicyNotEmpty => fl!("check-policy-not-empty"),
     }
@@ -230,6 +231,7 @@ mod tests {
             CheckId::DbusEnabled,
             CheckId::IpcReachable,
             CheckId::IpcPermission,
+            CheckId::DecisionsReversible,
             CheckId::InsertedDevicePolicy,
             CheckId::PolicyNotEmpty,
         ] {

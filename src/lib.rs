@@ -16,8 +16,7 @@
 // You should have received a copy of the GNU General Public License along
 // with this program. If not, see <https://www.gnu.org/licenses/>.
 
-//! Shared core for the `cosmic-usb-guard` window application and its panel
-//! applet.
+//! Shared core for the `cosmic-usb-guard` window application.
 //!
 //! This crate does not enforce USB policy — USBGuard does. Everything here is
 //! a front-end: it observes what the daemon reports, presents it, relays the
@@ -26,20 +25,22 @@
 #![warn(missing_docs)]
 
 pub mod app;
-pub mod applet;
+pub mod autostart;
 pub mod config;
 pub mod constants;
 pub mod debug;
+pub mod hooks;
 pub mod i18n;
 pub mod journal;
 pub mod notify;
 pub mod state;
 pub mod subscription;
 pub mod tasks;
+pub mod tray;
 pub mod ui;
 pub mod usbguard;
 
-/// One-time process setup shared by both binaries.
+/// One-time process setup.
 ///
 /// Installs a tracing subscriber, selects a locale, and notes the build in the
 /// debug log so a log file identifies which version produced it.
