@@ -42,6 +42,8 @@ pub const BLOCKED: &str = "changes-prevent-symbolic";
 pub const REMOVE: &str = "list-remove-symbolic";
 /// Copy to clipboard.
 pub const COPY: &str = "edit-copy-symbolic";
+/// Dismiss a message.
+pub const CLOSE: &str = "window-close-symbolic";
 /// Reload.
 pub const REFRESH: &str = "view-refresh-symbolic";
 /// Quit, in the tray menu.
@@ -52,6 +54,20 @@ pub const HOOK: &str = "system-run-symbolic";
 pub const HISTORY: &str = "document-open-recent-symbolic";
 /// Application settings.
 pub const SETTINGS: &str = "preferences-system-symbolic";
+
+/// The Thunderbolt glyph, compiled in.
+///
+/// Embedded rather than named because no theme COSMIC follows has one:
+/// `thunderbolt-symbolic` exists only in Adwaita, which the COSMIC theme does
+/// not inherit far enough to reach, and the name rendered as a blank square in
+/// the navigation. `tests/icons.rs` checks every *named* icon against the
+/// theme COSMIC actually renders with, which is what would have caught it.
+const THUNDERBOLT_SVG: &[u8] = include_bytes!("../../res/icons/ui/thunderbolt-symbolic.svg");
+
+/// A Thunderbolt or USB4 device, and the Thunderbolt page.
+pub fn thunderbolt() -> cosmic::widget::icon::Handle {
+    cosmic::widget::icon::from_svg_bytes(THUNDERBOLT_SVG).symbolic(true)
+}
 
 /// Panel icon: protecting, nothing outstanding.
 pub const PANEL_OK: &str = "security-high-symbolic";
@@ -138,12 +154,14 @@ mod tests {
                 severity: Severity::Ok,
                 detail: String::new(),
                 remedy: None,
+                steps: None,
             },
             other => Check {
                 id: CheckId::DaemonRunning,
                 severity: other,
                 detail: String::new(),
                 remedy: None,
+                steps: None,
             },
         };
         Health {

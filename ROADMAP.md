@@ -32,7 +32,7 @@ recorded, and you can change your mind.
 - [x] Installation health checks probed against the running system, each with a
       copyable fix-it command
 - [x] Settings through `cosmic-config`, shared between both binaries
-- [x] Localisation scaffolding with enforced locale parity
+- [x] Localization scaffolding with enforced locale parity
 - [x] `.deb`, `.rpm` and tarball packaging, tag-triggered releases
 
 ## 0.2 — Filling the gaps
@@ -66,7 +66,7 @@ The known limitations, in rough order of how much they hurt.
 - [ ] **Device fingerprint changes.** Warn when a device presenting a
       previously-seen serial number now reports different interfaces — a strong
       signal that it is not the device you allowed.
-- [ ] **Temporary allow.** Authorise until unplug or until a timer expires,
+- [ ] **Temporary allow.** Authorize until unplug or until a timer expires,
       without writing a rule. Useful for "I just need to copy one file".
 - [ ] **Per-device notes.** A free-text label stored alongside the hash, so
       "the black drive from the conference" is identifiable a year later.
@@ -90,7 +90,7 @@ The known limitations, in rough order of how much they hurt.
 Things that have come up and were decided against, with the reason, so they do
 not get re-litigated.
 
-- **Reimplementing USBGuard's enforcement.** This is a front-end. Authorisation
+- **Reimplementing USBGuard's enforcement.** This is a front-end. Authorization
   belongs in a privileged daemon that has been reviewed; duplicating it in a
   GUI would be worse in every way.
 - **Running the GUI as root.** It talks to the daemon over D-Bus with Polkit

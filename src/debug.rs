@@ -51,6 +51,8 @@ pub const NOTIFY: &str = "NOTIFY";
 pub const TRAY: &str = "TRAY";
 /// Per-device hook programs.
 pub const HOOK: &str = "HOOK";
+/// Thunderbolt/USB4 and bolt.
+pub const THUNDERBOLT: &str = "TBOLT";
 
 struct Sink {
     file: Option<File>,
@@ -61,18 +63,39 @@ static SINK: OnceLock<Mutex<Sink>> = OnceLock::new();
 
 fn sink() -> &'static Mutex<Sink> {
     SINK.get_or_init(|| {
-        // Truncate once per process launch.
-        let file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(PATH)
-            .ok();
         Mutex::new(Sink {
-            file,
+            file: open_log(std::path::Path::new(PATH)),
             start: Instant::now(),
         })
     })
+}
+
+/// Open the log, truncated once per process launch.
+///
+/// The path is fixed and under `/tmp`, where any local user can create a
+/// name first. So the file is opened without following a symlink — one would
+/// otherwise point the truncation at any file this user can write — created
+/// owner-only, and dropped if it turns out to belong to someone else, who
+/// would then be able to read what was logged.
+fn open_log(path: &std::path::Path) -> Option<File> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    // Not truncated on open: only once it is known to be ours.
+    #[allow(clippy::suspicious_open_options)]
+    let file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .ok()?;
+    // SAFETY: `getuid` has no preconditions and cannot fail.
+    let uid = unsafe { libc::getuid() };
+    if file.metadata().ok()?.uid() != uid {
+        return None;
+    }
+    file.set_len(0).ok()?;
+    Some(file)
 }
 
 /// Write one already-formatted line. Called by [`debug_log!`]; not intended to
@@ -93,7 +116,7 @@ pub fn write(category: &str, args: Arguments<'_>) {
 
 /// Emit a line to the debug log.
 ///
-/// Expands to `if ENABLED { .. }`, so the optimiser removes it when logging is
+/// Expands to `if ENABLED { .. }`, so the optimizer removes it when logging is
 /// off — but the arguments are still type-checked, which stops disabled call
 /// sites from silently rotting.
 #[macro_export]
@@ -119,4 +142,51 @@ macro_rules! error_log {
     ($category:expr, $($arg:tt)*) => {
         $crate::debug::error($category, format_args!($($arg)*))
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "cosmic-usb-guard-debuglog-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn the_log_is_not_opened_through_a_symlink() {
+        let dir = scratch("link");
+        let target = dir.join("victim");
+        std::fs::write(&target, "keep me").unwrap();
+        let link = dir.join("log");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert!(open_log(&link).is_none(), "followed a symlink");
+        // And the file it pointed at was not truncated.
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep me");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_new_log_is_owner_only_and_an_old_one_is_truncated() {
+        let dir = scratch("mode");
+        let path = dir.join("log");
+        std::fs::write(&path, "previous run").unwrap();
+
+        let mut file = open_log(&path).expect("our own file");
+        file.write_all(b"x").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "x");
+
+        std::fs::remove_file(&path).unwrap();
+        open_log(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

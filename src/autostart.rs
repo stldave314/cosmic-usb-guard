@@ -74,25 +74,34 @@ fn exec_command(minimized: bool) -> String {
 /// directory, anything — would otherwise autostart a truncated command that
 /// silently fails at login. Reserved characters are escaped inside the quotes
 /// as the specification requires.
+///
+/// The value is unescaped twice: first as a string value, where `\\` is one
+/// backslash, then by the quoting rules. So every backslash the quoting adds
+/// is doubled again — the specification's own example writes a literal
+/// backslash as four. And `%` introduces a field code anywhere in the line,
+/// so a literal one is written `%%`.
 fn quote_exec(argument: &str) -> String {
     const RESERVED: &[char] = &[
         ' ', '\t', '"', '\'', '\\', '>', '<', '~', '|', '&', ';', '$', '*', '?', '#', '(', ')', '`',
     ];
 
-    if !argument.contains(RESERVED) {
-        return argument.to_string();
-    }
-
-    let mut quoted = String::with_capacity(argument.len() + 2);
-    quoted.push('"');
-    for character in argument.chars() {
-        if matches!(character, '"' | '`' | '$' | '\\') {
-            quoted.push('\\');
+    let quoted = if argument.contains(RESERVED) {
+        let mut quoted = String::with_capacity(argument.len() + 2);
+        quoted.push('"');
+        for character in argument.chars() {
+            if matches!(character, '"' | '`' | '$' | '\\') {
+                quoted.push('\\');
+            }
+            quoted.push(character);
         }
-        quoted.push(character);
-    }
-    quoted.push('"');
-    quoted
+        quoted.push('"');
+        // The string-value layer: each backslash written once more.
+        quoted.replace('\\', "\\\\")
+    } else {
+        argument.to_string()
+    };
+
+    quoted.replace('%', "%%")
 }
 
 /// Write or remove the autostart entry.
@@ -179,9 +188,23 @@ mod tests {
             quote_exec("/home/me/My Projects/app"),
             "\"/home/me/My Projects/app\""
         );
-        // Reserved characters are escaped inside the quotes.
-        assert_eq!(quote_exec("/tmp/a$b"), "\"/tmp/a\\$b\"");
-        assert_eq!(quote_exec("/tmp/a\"b"), "\"/tmp/a\\\"b\"");
+        // Reserved characters are escaped inside the quotes, and that escape
+        // is itself escaped for the string-value layer.
+        assert_eq!(quote_exec("/tmp/a$b"), r#""/tmp/a\\$b""#);
+        assert_eq!(quote_exec("/tmp/a\"b"), r#""/tmp/a\\"b""#);
+    }
+
+    #[test]
+    fn percent_signs_and_backslashes_survive_both_layers_of_unescaping() {
+        // `%` starts a field code; written once it would be dropped or
+        // expanded at login.
+        assert_eq!(quote_exec("/opt/100%/app"), "/opt/100%%/app");
+        // A literal backslash is four in the file: two for the quoting rules,
+        // doubled again for the string value.
+        assert_eq!(quote_exec(r"/opt/a\b"), r#""/opt/a\\\\b""#);
+        // A quote is escaped for the quoting rules, and that backslash is
+        // doubled for the string value.
+        assert_eq!(quote_exec(r#"/opt/say "hi""#), r#""/opt/say \\"hi\\"""#);
     }
 
     #[test]

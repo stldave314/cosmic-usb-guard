@@ -3,7 +3,9 @@
 //! Device list, device details, and the decision prompt.
 
 use cosmic::iced::{Alignment, Length};
-use cosmic::widget::{button, column, container, divider, icon, row, text, text_input, toggler};
+use cosmic::widget::{
+    button, column, container, divider, icon, row, settings, text, text_input, toggler,
+};
 use cosmic::{Apply, Element, theme};
 
 use crate::fl;
@@ -19,7 +21,7 @@ fn spacing() -> cosmic::cosmic_theme::Spacing {
     theme::active().cosmic().spacing
 }
 
-/// A short coloured word describing the device's authorisation.
+/// A short colored word describing the device's authorization.
 fn state_badge<'a>(state: &State, device: &Device) -> Element<'a, Action> {
     let pending = device.daemon_id().is_some_and(|id| state.is_pending(id));
     let (label, class) = if pending {
@@ -34,6 +36,22 @@ fn state_badge<'a>(state: &State, device: &Device) -> Element<'a, Action> {
     };
 
     text::caption(label).class(class).into()
+}
+
+/// Whether Allow has anything left to do for a device.
+///
+/// Plugged in, it is offered until the device is allowed by both the live
+/// target and the policy — the path back from an accidental "no". Not plugged
+/// in, there is no live target, so the standing rule is all a decision can
+/// change: once that already says allow, the button would promise something
+/// that has already happened.
+fn offers_allow(connected: bool, live: Target, standing: Option<Target>) -> bool {
+    let allowed_always = standing == Some(Target::Allow);
+    if connected {
+        live != Target::Allow || !allowed_always
+    } else {
+        !allowed_always
+    }
 }
 
 /// The buttons offered for a device, given what state it is in.
@@ -53,7 +71,7 @@ fn actions<'a>(state: &State, device: &Device) -> Element<'a, Action> {
     // A decision has to be written as a rule in two cases the "remember this"
     // toggle does not cover.
     //
-    // Not plugged in: there is nothing to authorise right now, so a rule is
+    // Not plugged in: there is nothing to authorize right now, so a rule is
     // the only thing a decision can be.
     //
     // Contradicted by a standing rule: a one-off decision would be undone on
@@ -62,20 +80,21 @@ fn actions<'a>(state: &State, device: &Device) -> Element<'a, Action> {
     // is the least that makes the click mean anything.
     let contradicted = standing.is_some_and(|standing| standing != Target::Allow);
     let permanent = state.permanent || !device.is_connected() || contradicted;
+    // Changing a decision keeps the port binding it already had; binding or
+    // releasing is the detail switch's job, not a side effect of Allow.
+    let bind = state.standing_port(device).is_some() && state.port_mismatch(device).is_none();
 
     let enabled = |action: Action| (!busy).then_some(action);
     let mut controls = row::with_capacity(3).spacing(space.space_xxs);
 
-    // Allow, whenever the device is not already allowed by both the live
-    // target and the policy. This is the path back from an accidental "no".
     let allowed_now = device.is_connected() && device.target == Target::Allow;
-    let allowed_always = standing == Some(Target::Allow);
-    if !allowed_now || !allowed_always {
+    if offers_allow(device.is_connected(), device.target, standing) {
         controls = controls.push(button::suggested(fl!("allow")).on_press_maybe(enabled(
             Action::Decide {
                 key: key.clone(),
                 target: Target::Allow,
                 permanent,
+                bind,
             },
         )));
     }
@@ -86,12 +105,13 @@ fn actions<'a>(state: &State, device: &Device) -> Element<'a, Action> {
                 key: key.clone(),
                 target: Target::Block,
                 permanent,
+                bind,
             },
         )));
     }
 
     // Revoke covers the one case where removing the rule is not enough on its
-    // own: the device is authorised *right now*, so it also has to be blocked
+    // own: the device is authorized *right now*, so it also has to be blocked
     // or it stays usable until it is unplugged.
     if allowed_now {
         controls = controls.push(
@@ -137,7 +157,7 @@ pub fn row_view<'a>(state: &State, device: &Device) -> Element<'a, Action> {
         .width(Length::Fill);
 
     // For a device that is not plugged in, the standing rule *is* its status —
-    // there is no live authorisation to report — so it goes on the row rather
+    // there is no live authorization to report — so it goes on the row rather
     // than being buried in the detail.
     if !device.is_connected()
         && let Some(caption) = standing_caption(state, device)
@@ -150,9 +170,9 @@ pub fn row_view<'a>(state: &State, device: &Device) -> Element<'a, Action> {
     }
 
     // `Button::ListItem`, not `Button::Transparent`. A button sets the text
-    // colour for everything inside it, and Transparent's foreground colour is
+    // color for everything inside it, and Transparent's foreground color is
     // literally rgba(0,0,0,0) — so the device name and summary rendered
-    // invisible while the status badge, which sets its own colour, did not.
+    // invisible while the status badge, which sets its own color, did not.
     let summary = row::with_capacity(4)
         .push(icon::from_name(icons::for_device(device)).size(24))
         .push(heading)
@@ -202,7 +222,7 @@ pub fn row_view<'a>(state: &State, device: &Device) -> Element<'a, Action> {
     content.into()
 }
 
-/// Warnings to show inline for a device, honouring the user's preference.
+/// Warnings to show inline for a device, honoring the user's preference.
 fn warnings_for(state: &State, device: &Device) -> Vec<String> {
     if !state.config.settings.warn_input_capable {
         return Vec::new();
@@ -216,33 +236,79 @@ fn warnings_for(state: &State, device: &Device) -> Vec<String> {
     }
 }
 
-/// One labelled field of the expanded detail.
+/// A switch for the end of a [`settings::item`] row.
+///
+/// The row puts the label on the left at full width and the switch on the
+/// right, the same as the Settings page. A toggler's own `.label()` instead
+/// sets the label hard against the switch, which looked like one cramped
+/// widget rather than a label and its control.
+fn switch<'a>(
+    value: bool,
+    on_toggle: impl Fn(bool) -> Action + 'a,
+) -> cosmic::widget::Toggler<'a, Action> {
+    toggler(value).width(Length::Shrink).on_toggle(on_toggle)
+}
+
+/// Width of the trailing slot every field row reserves for a copy button.
+///
+/// Reserved whether or not the row has a button. The label and value columns
+/// share what is left by proportion, so a button present on some rows and
+/// absent on others used to shift those rows' values sideways and make them
+/// taller, which is what made the detail look ragged.
+const FIELD_ACTION_SLOT: f32 = 32.0;
+
+/// One labeled field of the expanded detail.
 fn field<'a>(label: String, value: String, copyable: bool) -> Element<'a, Action> {
     let space = spacing();
-    let shown = format::field_or_placeholder(&value);
+    // Shown trimmed (USBGuard reports some names with a leading space, which
+    // set them off from the column), copied exactly as reported.
+    let shown = format::field_or_placeholder(value.trim());
 
-    let mut line = row::with_capacity(3)
-        .push(text::caption(label).width(Length::FillPortion(2)))
-        .push(text::caption(shown).width(Length::FillPortion(3)))
-        .spacing(space.space_xs)
-        .align_y(Alignment::Center);
+    let action: Element<'a, Action> = if copyable && !value.trim().is_empty() {
+        button::icon(icon::from_name(icons::COPY).size(16))
+            .on_press(Action::Copy(value))
+            .into()
+    } else {
+        cosmic::widget::Space::new().into()
+    };
 
-    if copyable && !value.trim().is_empty() {
-        line = line.push(
-            button::icon(icon::from_name(icons::COPY).size(14))
-                .on_press(Action::Copy(value))
-                .padding(space.space_xxxs),
-        );
-    }
-
-    line.into()
+    row::with_capacity(3)
+        .push(text::body(label).width(Length::FillPortion(2)))
+        // Hashes and serials are one long word. Without breaking inside a
+        // word when it has to, the descriptor hash ran under the copy button
+        // and out of the card.
+        .push(
+            text::body(shown)
+                .wrapping(cosmic::iced::widget::text::Wrapping::WordOrGlyph)
+                .width(Length::FillPortion(3)),
+        )
+        .push(
+            container(action)
+                .width(Length::Fixed(FIELD_ACTION_SLOT))
+                .height(Length::Fixed(FIELD_ACTION_SLOT))
+                .align_x(Alignment::Center)
+                .align_y(Alignment::Center),
+        )
+        .spacing(space.space_s)
+        .align_y(Alignment::Center)
+        .into()
 }
 
 /// The expanded detail for a device.
 pub fn detail<'a>(state: &State, device: &Device) -> Element<'a, Action> {
     let space = spacing();
 
-    let mut fields = column::with_capacity(8)
+    // An unplugged device has no live authorization. Its rule target is what
+    // the parsed rule says, and showing "Allowed" for something that is not
+    // attached reads as if it were in use; the standing rule is reported
+    // separately below.
+    let status = if device.is_connected() {
+        format::target_label(device.target)
+    } else {
+        fl!("state-disconnected")
+    };
+
+    let fields = column::with_capacity(8)
         .push(field(fl!("field-name"), device.name.clone(), false))
         .push(field(fl!("field-usb-id"), device.usb_id(), true))
         .push(field(fl!("field-serial"), device.serial.clone(), true))
@@ -266,60 +332,82 @@ pub fn detail<'a>(state: &State, device: &Device) -> Element<'a, Action> {
         // claiming someone else's vendor and product IDs, so it is shown and
         // made copyable rather than hidden as an implementation detail.
         .push(field(fl!("field-hash"), device.hash.clone(), true))
-        .push(field(
-            fl!("field-status"),
-            format::target_label(device.target),
-            false,
-        ))
+        .push(field(fl!("field-status"), status, false))
         .spacing(space.space_xxs);
 
+    // What the policy says and anything worth warning about, as a block of
+    // its own rather than more rows that look like fields.
+    let mut notes = column::with_capacity(5).spacing(space.space_xxs);
+    let mut has_notes = false;
+
     if let Some(caption) = standing_caption(state, device) {
-        fields = fields.push(caption);
+        notes = notes.push(caption);
+        has_notes = true;
     }
 
     // A one-off decision leaves the device in a state the policy will undo on
     // the next replug. Silence here is how someone ends up sure they fixed
     // something that comes back.
     if let Some(standing) = state.standing_rule_conflicts(device) {
-        fields = fields.push(
+        notes = notes.push(
             text::caption(fl!(
                 "warning-standing-conflict",
                 target = format::target_label(standing)
             ))
             .class(super::warning_text()),
         );
+        has_notes = true;
+    }
+
+    if let Some(rule) = state.overriding_rule(device) {
+        notes = notes.push(
+            text::caption(fl!("warning-overriding-rule", rule = rule.rule.raw.clone()))
+                .class(super::warning_text()),
+        );
+        has_notes = true;
     }
 
     for warning in format::device_warnings(device) {
-        fields = fields.push(text::caption(warning).class(theme::Text::Accent));
+        notes = notes.push(text::caption(warning).class(theme::Text::Accent));
+        has_notes = true;
     }
 
     if device.hash.is_empty() {
-        fields = fields.push(text::caption(fl!("warning-no-hash")).class(theme::Text::Accent));
+        notes = notes.push(text::caption(fl!("warning-no-hash")).class(theme::Text::Accent));
+        has_notes = true;
     }
 
     // Marking is keyed on the descriptor hash, so a device that reports none
     // cannot be marked at all. Saying that is better than a toggle that
     // silently does nothing.
-    if device.hash.is_empty() {
-        fields = fields.push(text::caption(fl!("device-internal-no-hash")));
+    let internal: Element<'a, Action> = if device.hash.is_empty() {
+        text::caption(fl!("device-internal-no-hash")).into()
     } else {
         let hash = device.hash.clone();
-        fields = fields.push(
-            toggler(state.is_internal(device))
-                .label(fl!("device-internal-toggle"))
-                .on_toggle(move |internal| Action::SetInternal {
+        settings::item::builder(fl!("device-internal-toggle"))
+            .description(fl!("device-internal-description"))
+            .control(switch(state.is_internal(device), move |internal| {
+                Action::SetInternal {
                     hash: hash.clone(),
                     internal,
-                }),
-        );
-        fields = fields.push(text::caption(fl!("device-internal-description")));
+                }
+            }))
+            .into()
+    };
+
+    let mut card = column::with_capacity(7).push(fields).spacing(space.space_s);
+    if has_notes {
+        card = card.push(divider::horizontal::default()).push(notes);
     }
+    if let Some(binding) = binding_switch(state, device) {
+        card = card.push(divider::horizontal::default()).push(binding);
+    }
+    card = card.push(divider::horizontal::default()).push(internal);
 
     let mut sections = column::with_capacity(2)
         .push(
-            container(fields)
-                .padding(space.space_xs)
+            container(card)
+                .padding(space.space_s)
                 .class(theme::Container::Card)
                 .width(Length::Fill),
         )
@@ -332,6 +420,44 @@ pub fn detail<'a>(state: &State, device: &Device) -> Element<'a, Action> {
     }
 
     sections.into()
+}
+
+/// The "bound to USB port" switch for a device with a standing rule.
+///
+/// `None` when there is no standing rule to bind. For a device that is not
+/// plugged in and not bound, the switch is shown disabled with the reason:
+/// there is no current port to bind it to, but the option should not seem to
+/// have vanished.
+fn binding_switch<'a>(state: &State, device: &Device) -> Option<Element<'a, Action>> {
+    if !state.has_standing_rule(device) {
+        return None;
+    }
+    let busy = state.busy.contains(&device.key());
+    let bound = state.standing_port(device);
+
+    let description = match bound {
+        Some(port) => fl!("bound-port-description", port = port.to_string()),
+        None if device.can_bind_port() => fl!("bound-port-description-unbound"),
+        None => fl!("bound-port-unplugged"),
+    };
+
+    // Binding needs a current port; releasing never does.
+    let can_change = !busy && (bound.is_some() || device.can_bind_port());
+    let key = device.key();
+
+    Some(
+        settings::item::builder(fl!("bound-port-toggle"))
+            .description(description)
+            .control(
+                toggler(bound.is_some())
+                    .width(Length::Shrink)
+                    .on_toggle_maybe(can_change.then_some(move |bound| Action::SetBound {
+                        key: key.clone(),
+                        bound,
+                    })),
+            )
+            .into(),
+    )
 }
 
 /// A short description of what is wrong with a hook's program.
@@ -359,7 +485,7 @@ fn hook_view<'a>(state: &State, device: &Device) -> Element<'a, Action> {
         // Says the security rule out loud, next to the control that sets it
         // up, rather than only in the manual.
         .push(text::caption(fl!("hook-description")))
-        .spacing(space.space_xxs);
+        .spacing(space.space_xs);
 
     match editing {
         Some(draft) => {
@@ -389,9 +515,8 @@ fn hook_view<'a>(state: &State, device: &Device) -> Element<'a, Action> {
                         }),
                 )
                 .push(
-                    toggler(draft.enabled)
-                        .label(fl!("hook-enabled"))
-                        .on_toggle(Action::HookEnabled),
+                    settings::item::builder(fl!("hook-enabled"))
+                        .control(switch(draft.enabled, Action::HookEnabled)),
                 );
 
             // Validate before saving, not after the drive goes in at 3 a.m.
@@ -466,11 +591,11 @@ fn hook_view<'a>(state: &State, device: &Device) -> Element<'a, Action> {
 
     body = body.push(text::caption(fl!(
         "hook-variables",
-        names = crate::hooks::ENV_NAME
+        names = crate::hooks::ENV_ALL.join(", ")
     )));
 
     container(body)
-        .padding(space.space_xs)
+        .padding(space.space_s)
         .class(theme::Container::Card)
         .width(Length::Fill)
         .into()
@@ -504,9 +629,41 @@ pub fn prompt<'a>(state: &State, device: &Device) -> Element<'a, Action> {
         );
     }
 
-    let remember = toggler(state.permanent)
-        .label(fl!("remember-decision"))
-        .on_toggle(Action::SetPermanent);
+    // A device whose rule is bound to another port is here because of that,
+    // and would otherwise look like a device the user had never seen.
+    if let Some((bound, now)) = state.port_mismatch(device) {
+        body = body.push(
+            row::with_capacity(2)
+                .push(icon::from_name(icons::WARNING).size(16))
+                .push(text::caption(fl!(
+                    "prompt-wrong-port",
+                    bound = bound,
+                    port = now
+                )))
+                .align_y(Alignment::Center)
+                .spacing(space.space_xxs),
+        );
+    }
+
+    let remember = settings::item::builder(fl!("remember-decision"))
+        .control(switch(state.permanent, Action::SetPermanent));
+
+    // Only offered where there is a port to bind to. Disabled rather than
+    // hidden while "remember" is off, so it is clear binding exists and what
+    // it depends on: a one-off decision writes no rule to bind.
+    let bound_here = state.bind == Some(id);
+    let bind = device.can_bind_port().then(|| {
+        settings::item::builder(fl!("bind-to-port", port = device.via_port.clone()))
+            .description(fl!("bind-to-port-description"))
+            .control(
+                toggler(state.permanent && bound_here)
+                    .width(Length::Shrink)
+                    .on_toggle_maybe(state.permanent.then_some(move |bind| Action::SetBind {
+                        device_id: id,
+                        bind,
+                    })),
+            )
+    });
 
     let buttons = row::with_capacity(3)
         .push(button::text(fl!("dismiss")).on_press(Action::DismissPrompt { device_id: id }))
@@ -516,6 +673,7 @@ pub fn prompt<'a>(state: &State, device: &Device) -> Element<'a, Action> {
                 key: key.clone(),
                 target: Target::Block,
                 permanent: state.permanent,
+                bind: bound_here,
             })),
         )
         .push(
@@ -523,14 +681,22 @@ pub fn prompt<'a>(state: &State, device: &Device) -> Element<'a, Action> {
                 key,
                 target: Target::Allow,
                 permanent: state.permanent,
+                bind: bound_here,
             })),
         )
         .spacing(space.space_xxs)
         .align_y(Alignment::Center);
 
+    let mut options = column::with_capacity(2)
+        .push(remember)
+        .spacing(space.space_xs);
+    if let Some(bind) = bind {
+        options = options.push(bind);
+    }
+
     column::with_capacity(4)
         .push(body)
-        .push(remember)
+        .push(options)
         .push(buttons)
         .spacing(space.space_s)
         .apply(container)
@@ -598,4 +764,30 @@ pub fn list<'a>(state: &State) -> Element<'a, Action> {
     }
 
     list.into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn allow_is_not_offered_for_an_unplugged_device_that_is_already_always_allowed() {
+        // The button used to appear here, and pressing it could only remove
+        // the rule and write it back.
+        assert!(!offers_allow(false, Target::Allow, Some(Target::Allow)));
+
+        // Still the way back from a remembered "no", and still offered when
+        // the policy could not be read.
+        assert!(offers_allow(false, Target::Block, Some(Target::Block)));
+        assert!(offers_allow(false, Target::Block, Some(Target::Reject)));
+        assert!(offers_allow(false, Target::Block, None));
+    }
+
+    #[test]
+    fn allow_is_offered_for_a_plugged_in_device_until_both_halves_agree() {
+        assert!(offers_allow(true, Target::Block, Some(Target::Allow)));
+        assert!(offers_allow(true, Target::Allow, None));
+        assert!(offers_allow(true, Target::Allow, Some(Target::Block)));
+        assert!(!offers_allow(true, Target::Allow, Some(Target::Allow)));
+    }
 }

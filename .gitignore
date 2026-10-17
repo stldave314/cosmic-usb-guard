@@ -4,7 +4,6 @@
 *.pdb
 
 # Editor and tooling
-.claude/
 .vscode/
 .idea/
 *.swp

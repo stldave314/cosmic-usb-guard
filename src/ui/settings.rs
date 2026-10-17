@@ -32,7 +32,7 @@ pub fn view<'a>(state: &State) -> Element<'a, Action> {
     let space = spacing();
     let settings = &state.config.settings;
 
-    let behaviour = settings::section()
+    let behavior = settings::section()
         .title(fl!("section-behaviour"))
         .add(toggle(
             fl!("setting-prompt-on-insert"),
@@ -140,7 +140,9 @@ pub fn view<'a>(state: &State) -> Element<'a, Action> {
             fl!("setting-journal-enabled"),
             fl!(
                 "setting-journal-enabled-description",
-                path = journal::path().display().to_string()
+                path = journal::path()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default()
             ),
             settings.journal_enabled,
             SettingChange::JournalEnabled,
@@ -149,7 +151,7 @@ pub fn view<'a>(state: &State) -> Element<'a, Action> {
     column::with_capacity(5)
         .push(text::title3(fl!("page-settings")))
         .push(startup)
-        .push(behaviour)
+        .push(behavior)
         .push(display)
         .push(history)
         .spacing(space.space_m)

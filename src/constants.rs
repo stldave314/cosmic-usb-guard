@@ -54,6 +54,35 @@ pub const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 pub const RECONNECT_DELAY_MAX: Duration = Duration::from_secs(60);
 
 // ---------------------------------------------------------------------------
+// Thunderbolt / USB4
+// ---------------------------------------------------------------------------
+
+/// bolt's bus name, needed for the signal match and the properties reads,
+/// neither of which go through a generated proxy.
+pub const BOLT_BUS: &str = "org.freedesktop.bolt";
+
+/// Where the kernel lists Thunderbolt domains and devices.
+pub const THUNDERBOLT_SYSFS: &str = "/sys/bus/thunderbolt/devices";
+
+/// bolt's D-Bus activation file. Present means bolt is installed, so a bolt
+/// that does not answer is stopped or broken rather than missing.
+pub const BOLT_SERVICE_FILE: &str =
+    "/usr/share/dbus-1/system-services/org.freedesktop.bolt.service";
+
+/// The policy a device is enrolled with when the user picks "always allow".
+///
+/// `default` defers to bolt's own `DefaultPolicy`, so the system's
+/// configuration — not this app — decides whether a remembered device is
+/// authorized by itself next time.
+pub const BOLT_ENROLL_POLICY: &str = "default";
+
+/// How long to let a burst of bolt signals settle before re-reading.
+///
+/// Plugging a dock in produces a run of property changes within a few
+/// milliseconds; one re-read after them is enough.
+pub const THUNDERBOLT_EVENT_SETTLE: Duration = Duration::from_millis(150);
+
+// ---------------------------------------------------------------------------
 // Polling and refresh
 // ---------------------------------------------------------------------------
 
@@ -140,5 +169,5 @@ pub const PARAM_INSERTED_DEVICE_POLICY: &str = "InsertedDevicePolicy";
 pub const INSERTED_POLICY_PREFERRED: &str = "apply-policy";
 
 /// Values of [`PARAM_INSERTED_DEVICE_POLICY`] that defeat interactive
-/// prompting entirely, because the device is authorised before we can ask.
+/// prompting entirely, because the device is authorized before we can ask.
 pub const INSERTED_POLICY_UNSAFE: &[&str] = &["allow", "keep"];

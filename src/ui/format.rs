@@ -8,10 +8,10 @@
 use crate::constants::DESCRIPTION_ELIDE_CHARS;
 use crate::fl;
 use crate::journal::{Actor, Entry, Kind};
-use crate::usbguard::health::CheckId;
+use crate::usbguard::health::{CheckGroup, CheckId, Steps};
 use crate::usbguard::{Device, Severity, Target};
 
-/// Label for a device's current authorisation.
+/// Label for a device's current authorization.
 pub fn target_label(target: Target) -> String {
     match target {
         Target::Allow => fl!("state-allowed"),
@@ -59,7 +59,76 @@ pub fn check_label(id: CheckId) -> String {
         CheckId::DecisionsReversible => fl!("check-decisions-reversible"),
         CheckId::InsertedDevicePolicy => fl!("check-inserted-policy"),
         CheckId::PolicyNotEmpty => fl!("check-policy-not-empty"),
+        CheckId::ThunderboltSecurity => fl!("check-thunderbolt-security"),
+        CheckId::ThunderboltDmaProtection => fl!("check-thunderbolt-dma"),
+        CheckId::ThunderboltService => fl!("check-thunderbolt-service"),
+        CheckId::ThunderboltPermission => fl!("check-thunderbolt-permission"),
     }
+}
+
+/// A warning to show beside a check's fix command, when running it has a
+/// consequence worth knowing first.
+///
+/// Generating a policy allows every device that is plugged in at that moment —
+/// including one the user is being asked about, or has just blocked.
+pub fn remedy_caution(id: CheckId) -> Option<String> {
+    match id {
+        CheckId::PolicyNotEmpty => Some(fl!("remedy-policy-warning")),
+        _ => None,
+    }
+}
+
+/// Heading for a group of checks on the Status page.
+pub fn check_group_label(group: CheckGroup) -> String {
+    match group {
+        CheckGroup::UsbGuard => fl!("status-group-usbguard"),
+        CheckGroup::Thunderbolt => fl!("status-group-thunderbolt"),
+    }
+}
+
+/// Why a problem has steps rather than a command, in a sentence.
+pub fn steps_intro(steps: Steps) -> String {
+    match steps {
+        Steps::ThunderboltSecurity | Steps::DmaProtection => fl!("steps-firmware-only"),
+        Steps::InactiveSession => fl!("steps-session-only"),
+    }
+}
+
+/// The heading over a set of steps.
+pub fn steps_heading(steps: Steps) -> String {
+    match steps {
+        Steps::ThunderboltSecurity | Steps::DmaProtection => fl!("steps-heading"),
+        Steps::InactiveSession => fl!("steps-session-heading"),
+    }
+}
+
+/// Numbered instructions for a fix that is not a command.
+///
+/// Firmware fixes share their opening and closing steps, since getting into
+/// firmware setup and back out is the same whatever is changed there.
+pub fn steps(steps: Steps) -> Vec<String> {
+    let list = match steps {
+        Steps::ThunderboltSecurity | Steps::DmaProtection => {
+            let middle = match steps {
+                Steps::ThunderboltSecurity => vec![fl!("steps-tb-find"), fl!("steps-tb-set")],
+                _ => vec![fl!("steps-dma-set")],
+            };
+            std::iter::once(fl!("steps-restart"))
+                .chain(std::iter::once(fl!("steps-open-setup")))
+                .chain(middle)
+                .chain(std::iter::once(fl!("steps-save")))
+                .collect::<Vec<_>>()
+        }
+        Steps::InactiveSession => vec![
+            fl!("steps-session-local"),
+            fl!("steps-session-switch"),
+            fl!("steps-session-refresh"),
+        ],
+    };
+    list.into_iter()
+        .enumerate()
+        .map(|(index, step)| format!("{}. {step}", index + 1))
+        .collect()
 }
 
 /// Overall status headline for a severity.
@@ -234,8 +303,36 @@ mod tests {
             CheckId::DecisionsReversible,
             CheckId::InsertedDevicePolicy,
             CheckId::PolicyNotEmpty,
+            CheckId::ThunderboltSecurity,
+            CheckId::ThunderboltDmaProtection,
+            CheckId::ThunderboltService,
+            CheckId::ThunderboltPermission,
         ] {
             assert!(!check_label(id).is_empty(), "{id:?}");
+        }
+
+        for group in [CheckGroup::UsbGuard, CheckGroup::Thunderbolt] {
+            assert!(!check_group_label(group).is_empty(), "{group:?}");
+        }
+
+        for which in [Steps::ThunderboltSecurity, Steps::DmaProtection] {
+            // Restart, open setup, at least one change, save.
+            assert!(steps(which).len() >= 4, "{which:?}");
+        }
+        for which in [
+            Steps::ThunderboltSecurity,
+            Steps::DmaProtection,
+            Steps::InactiveSession,
+        ] {
+            let list = steps(which);
+            assert!(!steps_intro(which).is_empty() && !steps_heading(which).is_empty());
+            assert!(
+                list[0].starts_with("1. ")
+                    && list
+                        .last()
+                        .unwrap()
+                        .starts_with(&format!("{}. ", list.len()))
+            );
         }
     }
 }

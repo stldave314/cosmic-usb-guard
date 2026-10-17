@@ -8,7 +8,7 @@
 //! IPC. None of it is inferred from configuration files, because a USBGuard
 //! install can be present, syntactically valid and completely inert: the
 //! service can be disabled, the D-Bus bridge can be missing, the policy can be
-//! empty, or `InsertedDevicePolicy` can be set to `allow`, which authorises
+//! empty, or `InsertedDevicePolicy` can be set to `allow`, which authorizes
 //! every new device before anyone can be asked about it.
 
 use std::collections::HashMap;
@@ -20,6 +20,7 @@ use crate::constants::{
 use crate::debug_log;
 
 use super::client::{Client, Error};
+use super::model::PolicyRule;
 use super::proxy::{PolkitProxy, SystemdProxy};
 
 /// How badly a failed check compromises protection.
@@ -35,7 +36,7 @@ pub enum Severity {
 
 /// Which check a result belongs to.
 ///
-/// An enum rather than a string so the UI can localise the label and attach
+/// An enum rather than a string so the UI can localize the label and attach
 /// the right remedy without matching on prose.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CheckId {
@@ -53,10 +54,59 @@ pub enum CheckId {
     IpcPermission,
     /// This user is permitted to *undo* one.
     DecisionsReversible,
-    /// New devices are held for a decision rather than auto-authorised.
+    /// New devices are held for a decision rather than auto-authorized.
     InsertedDevicePolicy,
     /// The policy is not empty.
     PolicyNotEmpty,
+    /// Thunderbolt/USB4 devices need authorization before they get PCIe.
+    ThunderboltSecurity,
+    /// The IOMMU shields memory from Thunderbolt/USB4 devices.
+    ThunderboltDmaProtection,
+    /// The bolt service, which authorizes Thunderbolt devices, is reachable.
+    ThunderboltService,
+    /// This user may authorize Thunderbolt devices.
+    ThunderboltPermission,
+}
+
+/// Which part of the system a check is about, for grouping on the Status page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckGroup {
+    /// USBGuard and its D-Bus bridge.
+    UsbGuard,
+    /// Thunderbolt/USB4 and the bolt service.
+    Thunderbolt,
+}
+
+impl CheckId {
+    /// The group this check is listed under.
+    pub fn group(self) -> CheckGroup {
+        match self {
+            Self::ThunderboltSecurity
+            | Self::ThunderboltDmaProtection
+            | Self::ThunderboltService
+            | Self::ThunderboltPermission => CheckGroup::Thunderbolt,
+            _ => CheckGroup::UsbGuard,
+        }
+    }
+}
+
+/// Instructions for a problem no command can fix.
+///
+/// Some settings live only in the computer's firmware. Offering a command for
+/// those would be a lie, and offering nothing leaves the user stuck, so these
+/// name a set of translated, numbered steps instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Steps {
+    /// Raise the Thunderbolt security level in firmware setup.
+    ThunderboltSecurity,
+    /// Turn on the IOMMU / Kernel DMA Protection in firmware setup.
+    DmaProtection,
+    /// Use USBGuard from the active, local session.
+    ///
+    /// Polkit grants USBGuard's read calls only to the session at the
+    /// computer, so a refusal there is about where the app is running, not a
+    /// setting a command could change.
+    InactiveSession,
 }
 
 /// The outcome of one check.
@@ -70,34 +120,45 @@ pub struct Check {
     pub detail: String,
     /// A shell command that would fix it, if there is a simple one.
     pub remedy: Option<String>,
+    /// Steps to follow when the fix is not a command.
+    pub steps: Option<Steps>,
 }
 
 impl Check {
-    fn ok(id: CheckId, detail: impl Into<String>) -> Self {
+    pub(crate) fn ok(id: CheckId, detail: impl Into<String>) -> Self {
         Self {
             id,
             severity: Severity::Ok,
             detail: detail.into(),
             remedy: None,
+            steps: None,
         }
     }
 
-    fn warn(id: CheckId, detail: impl Into<String>, remedy: Option<String>) -> Self {
+    pub(crate) fn warn(id: CheckId, detail: impl Into<String>, remedy: Option<String>) -> Self {
         Self {
             id,
             severity: Severity::Warning,
             detail: detail.into(),
             remedy,
+            steps: None,
         }
     }
 
-    fn critical(id: CheckId, detail: impl Into<String>, remedy: Option<String>) -> Self {
+    pub(crate) fn critical(id: CheckId, detail: impl Into<String>, remedy: Option<String>) -> Self {
         Self {
             id,
             severity: Severity::Critical,
             detail: detail.into(),
             remedy,
+            steps: None,
         }
+    }
+
+    /// Attach instructions for a fix that is not a command.
+    pub(crate) fn with_steps(mut self, steps: Steps) -> Self {
+        self.steps = Some(steps);
+        self
     }
 }
 
@@ -182,7 +243,7 @@ fn check_unit_active(id: CheckId, unit: &str, state: &UnitState) -> Check {
             Some(format!("sudo systemctl start {unit}")),
         ),
         // systemd could not be queried; the IPC probe is the authority.
-        None => Check::warn(id, "unknown", None),
+        None => Check::warn(id, crate::fl!("observed-unknown"), None),
     }
 }
 
@@ -201,34 +262,71 @@ fn check_unit_enabled(id: CheckId, unit: &str, state: &UnitState) -> Check {
             other.to_string(),
             Some(format!("sudo systemctl enable {unit}")),
         ),
-        None => Check::warn(id, "unknown", None),
+        None => Check::warn(id, crate::fl!("observed-unknown"), None),
     }
 }
+
+/// Polkit action guarding a decision about a plugged-in device.
+const ACTION_APPLY_POLICY: &str = "org.usbguard.Devices1.applyDevicePolicy";
 
 /// Polkit action guarding rule removal, which is what undoing a decision needs.
 const ACTION_REMOVE_RULE: &str = "org.usbguard.Policy1.removeRule";
 
-/// Whether this session may remove a policy rule.
+/// A polkit answer about one of the calls this app makes, as a check.
 ///
 /// Asked of Polkit rather than of USBGuard, because there is no harmless way
-/// to ask USBGuard: `removeRule` takes a rule ID and deletes it, so probing
-/// with the real call would mean deleting one of the user's rules to find out
-/// whether deleting rules is allowed.
+/// to ask USBGuard: the calls change policy, so probing with the real one
+/// would mean making a decision — or deleting a rule — to find out whether
+/// that is allowed.
 ///
-/// `flags` is 0 — no user interaction — so this check never raises a dialog of
-/// its own. The three outcomes are genuinely different and are reported as
-/// such: allowed outright, allowed after authenticating, and refused.
-async fn check_decisions_reversible(connection: &zbus::Connection) -> Check {
+/// The three outcomes are genuinely different and are reported as such:
+/// allowed outright, allowed after authenticating (workable, so a warning),
+/// and refused.
+async fn polkit_permission(connection: &zbus::Connection, id: CheckId, action: &str) -> Check {
+    match polkit_check(connection, action).await {
+        Ok(Authorization::Granted) => Check::ok(id, crate::fl!("observed-granted")),
+        Ok(Authorization::Challenge) => Check::warn(
+            id,
+            crate::fl!("observed-password"),
+            Some(POLKIT_REMEDY.to_string()),
+        ),
+        Ok(Authorization::Refused) => Check::critical(
+            id,
+            crate::fl!("observed-refused"),
+            Some(POLKIT_REMEDY.to_string()),
+        ),
+        Err(detail) => Check::warn(id, detail, None),
+    }
+}
+
+/// What Polkit would say if this session attempted an action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Authorization {
+    /// Allowed outright.
+    Granted,
+    /// Allowed once the user authenticates.
+    Challenge,
+    /// Not allowed.
+    Refused,
+}
+
+/// Ask Polkit whether this connection may perform `action`.
+///
+/// `flags` is 0 — no user interaction — so asking never raises a dialog of its
+/// own. `Err` carries a short description of why Polkit could not be asked.
+pub async fn polkit_check(
+    connection: &zbus::Connection,
+    action: &str,
+) -> Result<Authorization, String> {
     let Some(name) = connection.unique_name() else {
-        return Check::warn(CheckId::DecisionsReversible, "unknown", None);
+        return Err(crate::fl!("observed-unknown"));
     };
 
-    let polkit = match PolkitProxy::new(connection).await {
-        Ok(polkit) => polkit,
-        // No Polkit at all: nothing to report, since the daemon's own
-        // authorisation is then whatever it is and `IpcPermission` covers it.
-        Err(_) => return Check::warn(CheckId::DecisionsReversible, "polkit unavailable", None),
-    };
+    // No Polkit at all: nothing to report, since the service's own
+    // authorization is then whatever it is.
+    let polkit = PolkitProxy::new(connection)
+        .await
+        .map_err(|_| crate::fl!("observed-polkit-unavailable"))?;
 
     let subject = (
         "system-bus-name",
@@ -236,49 +334,81 @@ async fn check_decisions_reversible(connection: &zbus::Connection) -> Check {
     );
 
     match polkit
-        .check_authorization(&subject, ACTION_REMOVE_RULE, HashMap::new(), 0, "")
+        .check_authorization(&subject, action, HashMap::new(), 0, "")
         .await
     {
-        Ok((true, _, _)) => Check::ok(CheckId::DecisionsReversible, "granted"),
-        // Permitted, but every removal will ask for an administrator password.
-        // Workable, so a warning rather than a failure.
-        Ok((false, true, _)) => Check::warn(
-            CheckId::DecisionsReversible,
-            "requires an administrator password",
-            Some(POLKIT_REMEDY.to_string()),
-        ),
-        Ok((false, false, _)) => Check::critical(
-            CheckId::DecisionsReversible,
-            "refused",
-            Some(POLKIT_REMEDY.to_string()),
-        ),
-        Err(e) => Check::warn(CheckId::DecisionsReversible, e.to_string(), None),
+        Ok((true, _, _)) => Ok(Authorization::Granted),
+        Ok((false, true, _)) => Ok(Authorization::Challenge),
+        Ok((false, false, _)) => Ok(Authorization::Refused),
+        Err(e) => Err(e.to_string()),
     }
 }
 
-/// Shell command that grants rule removal to the same groups the distribution
-/// already trusts with rule *creation*.
+/// Shell command that grants the three calls this app makes — making a
+/// decision, writing a rule, and removing one — to active local members of
+/// the administrator and `plugdev` groups.
+///
+/// Debian and Ubuntu already grant the first two to `sudo` and `plugdev`; the
+/// upstream defaults ask for an administrator password for all three, and
+/// removal is left at that everywhere. Granting removal is not a widening in
+/// practice: `appendRule` takes an insert position, so anyone who may append
+/// a rule can put an `allow` at the top of the policy.
 ///
 /// Written as a drop-in file rather than an edit to the packaged rules, so a
 /// package upgrade cannot silently revert it and nothing already there is
 /// disturbed. `50-` sorts before the shipped `org.usbguard1.rules`; Polkit
-/// takes the first rule that returns a result.
-const POLKIT_REMEDY: &str = concat!(
-    "sudo tee /etc/polkit-1/rules.d/50-usbguard-remove-rule.rules >/dev/null <<'EOF'\n",
+/// takes the first rule that returns a result. The file an earlier version
+/// suggested, which granted removal alone, is removed so the two cannot
+/// disagree.
+///
+/// `install -m 0644`, not `sudo tee`. polkitd runs as its own `polkitd` user
+/// and has to be able to read the file, and `tee` creates it with whatever
+/// mode the caller's umask leaves — under a umask of `0007`, sudo's combined
+/// umask makes it `0640 root:root`, which polkitd cannot open. It logs only
+/// "Error loading script", the rule silently never applies, and the command
+/// itself printed nothing to suggest anything went wrong. `install` sets the
+/// mode explicitly, and replacing the file is also what makes polkit reload.
+pub(crate) const POLKIT_REMEDY: &str = concat!(
+    "sudo install -m 0644 /dev/stdin /etc/polkit-1/rules.d/50-usbguard-desktop.rules <<'EOF'",
+    " && sudo rm -f /etc/polkit-1/rules.d/50-usbguard-remove-rule.rules\n",
     "polkit.addRule(function(action, subject) {\n",
-    "    if (action.id == \"org.usbguard.Policy1.removeRule\" &&\n",
+    "    if ((action.id == \"org.usbguard.Devices1.applyDevicePolicy\" ||\n",
+    "         action.id == \"org.usbguard.Policy1.appendRule\" ||\n",
+    "         action.id == \"org.usbguard.Policy1.removeRule\") &&\n",
     "        subject.active && subject.local &&\n",
-    "        (subject.isInGroup(\"plugdev\") || subject.isInGroup(\"sudo\"))) {\n",
+    "        (subject.isInGroup(\"plugdev\") || subject.isInGroup(\"sudo\") ||\n",
+    "         subject.isInGroup(\"wheel\"))) {\n",
     "        return polkit.Result.YES;\n",
     "    }\n",
     "});\nEOF"
+);
+
+/// Command that writes a policy from the devices plugged in now and makes the
+/// daemon use it.
+///
+/// `set-parameter` and a rewritten rules file both stop at the running
+/// daemon or the file respectively; the restart is what puts the new policy in
+/// force.
+const EMPTY_POLICY_REMEDY: &str = concat!(
+    "sudo sh -c 'usbguard generate-policy > /etc/usbguard/rules.conf",
+    " && chmod 0600 /etc/usbguard/rules.conf'",
+    " && sudo systemctl restart usbguard.service"
 );
 
 /// Run every check against the running system.
 ///
 /// `client` may be `None` when a connection could not be established at all;
 /// the systemd-derived checks still run, which is usually what explains it.
-pub async fn evaluate(client: Option<&Client>, connection: Option<&zbus::Connection>) -> Health {
+///
+/// `rules` is the policy as the refresh read it, or `None` when it could not
+/// be read. Passing it in rather than reading it again here keeps health from
+/// making its own policy call on every tick, past the latch that stops a
+/// refused call from being retried until the user asks.
+pub async fn evaluate(
+    client: Option<&Client>,
+    connection: Option<&zbus::Connection>,
+    rules: Option<&[PolicyRule]>,
+) -> Health {
     debug_log!(crate::debug::HEALTH, "evaluating installation health");
     let mut checks = Vec::new();
 
@@ -304,7 +434,7 @@ pub async fn evaluate(client: Option<&Client>, connection: Option<&zbus::Connect
     let Some(client) = client else {
         checks.push(Check::critical(
             CheckId::IpcReachable,
-            "no connection to the system bus",
+            crate::fl!("observed-no-bus"),
             None,
         ));
         debug_log!(
@@ -317,22 +447,27 @@ pub async fn evaluate(client: Option<&Client>, connection: Option<&zbus::Connect
     // The authoritative test: does the daemon actually answer?
     match client.get_parameter(PARAM_INSERTED_DEVICE_POLICY).await {
         Ok(value) => {
-            checks.push(Check::ok(CheckId::IpcReachable, "responding"));
+            checks.push(Check::ok(
+                CheckId::IpcReachable,
+                crate::fl!("observed-responding"),
+            ));
             checks.push(inserted_policy_check(&value));
         }
-        Err(Error::PermissionDenied(message)) => {
-            // Reaching the daemon at all proves it is running; we are just not
-            // allowed to talk to it.
-            checks.push(Check::ok(CheckId::IpcReachable, "responding"));
-            checks.push(Check::critical(
-                CheckId::IpcPermission,
-                message,
-                Some(format!(
-                    "sudo usbguard add-user {}",
-                    whoami().unwrap_or_else(|| "$USER".into())
-                )),
+        Err(Error::PermissionDenied(_)) => {
+            // Reaching the daemon at all proves it is running; this session is
+            // just not allowed to read from it. `usbguard-dbus` runs as root,
+            // so USBGuard's own IPC allow-list (`usbguard add-user`) does not
+            // come into it: this is Polkit, which grants USBGuard's read calls
+            // to the active local session and refuses everything else.
+            checks.push(Check::ok(
+                CheckId::IpcReachable,
+                crate::fl!("observed-responding"),
             ));
-            debug_log!(crate::debug::HEALTH, "IPC reachable but permission denied");
+            checks.push(
+                Check::critical(CheckId::IpcPermission, crate::fl!("observed-refused"), None)
+                    .with_steps(Steps::InactiveSession),
+            );
+            debug_log!(crate::debug::HEALTH, "IPC reachable but reads refused");
             return Health { checks };
         }
         Err(e) => {
@@ -346,41 +481,18 @@ pub async fn evaluate(client: Option<&Client>, connection: Option<&zbus::Connect
         }
     }
 
-    // Listing devices is the operation the UI depends on, so permission is
-    // tested with the real call rather than a proxy for it.
-    match client.list_devices().await {
-        Ok(_) => checks.push(Check::ok(CheckId::IpcPermission, "granted")),
-        Err(Error::PermissionDenied(message)) => checks.push(Check::critical(
-            CheckId::IpcPermission,
-            message,
-            Some(format!(
-                "sudo usbguard add-user {}",
-                whoami().unwrap_or_else(|| "$USER".into())
-            )),
-        )),
-        Err(e) => checks.push(Check::warn(CheckId::IpcPermission, e.to_string(), None)),
-    }
-
-    // Whether a decision can be taken back is part of whether this app works
-    // at all, and it is invisible until someone tries.
+    // Making and undoing a decision are separate Polkit actions, and either
+    // can be refused while reading works. Both are invisible until someone
+    // presses a button, so they are asked about here.
     if let Some(connection) = connection {
-        checks.push(check_decisions_reversible(connection).await);
+        checks
+            .push(polkit_permission(connection, CheckId::IpcPermission, ACTION_APPLY_POLICY).await);
+        checks.push(
+            polkit_permission(connection, CheckId::DecisionsReversible, ACTION_REMOVE_RULE).await,
+        );
     }
 
-    match client.list_rules().await {
-        Ok(rules) if rules.is_empty() => checks.push(Check::warn(
-            CheckId::PolicyNotEmpty,
-            "0 rules",
-            Some("sudo sh -c 'usbguard generate-policy > /etc/usbguard/rules.conf'".into()),
-        )),
-        Ok(rules) => checks.push(Check::ok(
-            CheckId::PolicyNotEmpty,
-            format!("{} rules", rules.len()),
-        )),
-        // Reading the policy needs its own Polkit action, which a user may
-        // lack while still being able to make device decisions.
-        Err(e) => checks.push(Check::warn(CheckId::PolicyNotEmpty, e.to_string(), None)),
-    }
+    checks.push(policy_check(rules));
 
     let health = Health { checks };
     debug_log!(
@@ -391,20 +503,47 @@ pub async fn evaluate(client: Option<&Client>, connection: Option<&zbus::Connect
     health
 }
 
+/// Judge the policy as read: empty, populated, or unreadable.
+///
+/// Reading the policy needs its own Polkit action, which a user may lack
+/// while still being able to make device decisions, so unreadable is a
+/// warning rather than a failure.
+fn policy_check(rules: Option<&[PolicyRule]>) -> Check {
+    match rules {
+        Some([]) => Check::warn(
+            CheckId::PolicyNotEmpty,
+            crate::fl!("observed-rules", count = 0),
+            // Restarted, because the daemon reads the file only at start.
+            // Shown with a warning (`format::remedy_caution`): this allows
+            // every device plugged in at the moment it runs.
+            Some(EMPTY_POLICY_REMEDY.into()),
+        ),
+        Some(rules) => Check::ok(
+            CheckId::PolicyNotEmpty,
+            crate::fl!("observed-rules", count = rules.len()),
+        ),
+        None => Check::warn(
+            CheckId::PolicyNotEmpty,
+            crate::fl!("observed-unreadable"),
+            None,
+        ),
+    }
+}
+
 /// Judge `InsertedDevicePolicy`, which decides what happens to a device
 /// between it being plugged in and the user deciding about it.
 fn inserted_policy_check(value: &str) -> Check {
-    let normalised = value.trim().to_lowercase();
-    if normalised == INSERTED_POLICY_PREFERRED {
-        Check::ok(CheckId::InsertedDevicePolicy, normalised)
-    } else if INSERTED_POLICY_UNSAFE.contains(&normalised.as_str()) {
-        // The device is authorised the moment it is plugged in, so a prompt
+    let normalized = value.trim().to_lowercase();
+    if normalized == INSERTED_POLICY_PREFERRED {
+        Check::ok(CheckId::InsertedDevicePolicy, normalized)
+    } else if INSERTED_POLICY_UNSAFE.contains(&normalized.as_str()) {
+        // The device is authorized the moment it is plugged in, so a prompt
         // would be asking permission for something that already happened.
         Check::critical(
             CheckId::InsertedDevicePolicy,
-            normalised,
+            normalized,
             Some(format!(
-                "sudo usbguard set-parameter {PARAM_INSERTED_DEVICE_POLICY} {INSERTED_POLICY_PREFERRED}"
+                "sudo usbguard set-parameter {PARAM_INSERTED_DEVICE_POLICY} {INSERTED_POLICY_PREFERRED} && sudo sed -i 's/^{PARAM_INSERTED_DEVICE_POLICY}=.*/{PARAM_INSERTED_DEVICE_POLICY}={INSERTED_POLICY_PREFERRED}/' /etc/usbguard/usbguard-daemon.conf"
             )),
         )
     } else {
@@ -412,22 +551,28 @@ fn inserted_policy_check(value: &str) -> Check {
         // user already allowed permanently is still blocked on insert.
         Check::warn(
             CheckId::InsertedDevicePolicy,
-            normalised,
+            normalized,
             Some(format!(
-                "sudo usbguard set-parameter {PARAM_INSERTED_DEVICE_POLICY} {INSERTED_POLICY_PREFERRED}"
+                "sudo usbguard set-parameter {PARAM_INSERTED_DEVICE_POLICY} {INSERTED_POLICY_PREFERRED} && sudo sed -i 's/^{PARAM_INSERTED_DEVICE_POLICY}=.*/{PARAM_INSERTED_DEVICE_POLICY}={INSERTED_POLICY_PREFERRED}/' /etc/usbguard/usbguard-daemon.conf"
             )),
         )
     }
 }
 
-/// The current user's login name, for building an `add-user` remedy.
-fn whoami() -> Option<String> {
-    std::env::var("USER").ok().filter(|u| !u.is_empty())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_polkit_remedy_writes_a_file_polkitd_can_read() {
+        // polkitd is not root. A file created through the caller's umask can
+        // come out unreadable to it, and then the rule never loads.
+        assert!(
+            POLKIT_REMEDY.starts_with("sudo install -m 0644 /dev/stdin "),
+            "the remedy must set the file mode itself: {POLKIT_REMEDY}"
+        );
+        assert!(!POLKIT_REMEDY.contains("tee"));
+    }
 
     #[test]
     fn allow_on_insert_is_critical_because_it_defeats_prompting() {

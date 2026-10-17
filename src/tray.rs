@@ -62,7 +62,7 @@ impl TrayState {
             } else {
                 Severity::Warning
             },
-            pending: state.pending.len(),
+            pending: state.pending_count(),
         }
     }
 
@@ -200,7 +200,7 @@ impl ksni::Tray for Indicator {
 /// A running tray icon.
 ///
 /// Dropping this withdraws the icon, which is how the "hide the tray icon"
-/// setting is honoured without restarting the app.
+/// setting is honored without restarting the app.
 pub struct Tray {
     handle: ksni::Handle<Indicator>,
 }

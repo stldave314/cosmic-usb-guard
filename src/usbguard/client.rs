@@ -59,7 +59,7 @@ impl Error {
 /// D-Bus reports "service is not running" and "you may not do that" as errors
 /// that look alike at the transport level but need very different responses
 /// from the UI, so they are separated here by error name.
-fn classify(error: zbus::Error) -> Error {
+pub(crate) fn classify(error: zbus::Error) -> Error {
     if let zbus::Error::MethodError(name, message, _) = &error {
         return classify_method_error(name.as_str(), message.clone().unwrap_or_default());
     }
@@ -85,7 +85,7 @@ fn classify_method_error(name: &str, message: String) -> Error {
             Error::PermissionDenied(message)
         }
         // USBGuard wraps its own failures in a generic exception, so fall
-        // back to inspecting the message for the authorisation case.
+        // back to inspecting the message for the authorization case.
         _ => {
             let lowered = message.to_lowercase();
             if lowered.contains("not authorized")
@@ -113,7 +113,7 @@ fn classify_method_error(name: &str, message: String) -> Error {
 /// Only mutating calls get the flag. The read calls are made on a timer, and
 /// a timer that can raise password prompts is a good way to train someone to
 /// type their password into whatever asks.
-async fn call_interactive<'a, B, R>(
+pub(crate) async fn call_interactive<'a, B, R>(
     proxy: &zbus::Proxy<'a>,
     method: &str,
     body: &B,
@@ -141,7 +141,9 @@ where
 /// Calls are Polkit-mediated, so a slow reply usually means an authentication
 /// dialog is waiting on the user rather than that anything is wrong; the bound
 /// exists so a lost reply cannot wedge the UI forever.
-async fn with_timeout<T>(future: impl Future<Output = zbus::Result<T>>) -> Result<T, Error> {
+pub(crate) async fn with_timeout<T>(
+    future: impl Future<Output = zbus::Result<T>>,
+) -> Result<T, Error> {
     match tokio::time::timeout(DBUS_CALL_TIMEOUT, future).await {
         Err(_) => Err(Error::Timeout),
         Ok(Err(e)) => Err(classify(e)),
@@ -233,7 +235,7 @@ impl Client {
         Ok(devices)
     }
 
-    /// Apply an authorisation decision to a device.
+    /// Apply an authorization decision to a device.
     ///
     /// When `permanent` is set the daemon writes a matching rule into the
     /// policy so the decision survives a replug and a reboot.
@@ -315,7 +317,7 @@ impl Client {
     ///
     /// This is what "revoke" means for a device the user previously allowed
     /// permanently: the standing rule has to go, not just the live
-    /// authorisation. Returns the number of rules removed.
+    /// authorization. Returns the number of rules removed.
     pub async fn remove_rules_for_hash(&self, hash: &str) -> Result<usize, Error> {
         if hash.is_empty() {
             return Ok(0);
@@ -373,7 +375,7 @@ mod tests {
     #[test]
     fn classifies_usbguard_exception_text_as_permission_denied() {
         // USBGuard wraps its own failures in a generic exception name, so the
-        // authorisation case is only visible in the message.
+        // authorization case is only visible in the message.
         let error = classify_error(
             "org.usbguard.Exception",
             "The caller is Not authorized to perform this action",

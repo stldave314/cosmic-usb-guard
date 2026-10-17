@@ -26,11 +26,23 @@ pub const ACTION_BLOCK: &str = "block";
 pub const ACTION_DETAILS: &str = "details";
 /// Action key sent back from a refusal notice, asking to manage the device.
 pub const ACTION_MANAGE: &str = "manage";
+/// Action key: authorize a Thunderbolt device for this connection.
+pub const ACTION_ALLOW_ONCE: &str = "allow-once";
+/// Action key: authorize a Thunderbolt device and remember it.
+pub const ACTION_ALWAYS_ALLOW: &str = "always-allow";
 
 /// A connection to the notification daemon.
 #[derive(Clone)]
 pub struct Notifier {
     proxy: crate::usbguard::proxy::NotificationsProxy<'static>,
+    /// Whether the server renders markup in the body.
+    ///
+    /// Bodies carry device-supplied names. A server that renders markup
+    /// would otherwise let a device named `<a href=…>update</a>` put a link
+    /// in the prompt, or one named `x<!--` hide the rest of it — including
+    /// the warning that it can type. Escaped only where markup is rendered,
+    /// since a plain-text server would show the escapes literally.
+    markup: bool,
 }
 
 impl std::fmt::Debug for Notifier {
@@ -54,8 +66,18 @@ impl Notifier {
         };
         match crate::usbguard::proxy::NotificationsProxy::new(&connection).await {
             Ok(proxy) => {
-                debug_log!(crate::debug::NOTIFY, "notification proxy ready");
-                Some(Self { proxy })
+                // Unknown capabilities count as markup: escaping a plain-text
+                // body costs some stray entities, not rendering one is worse.
+                let markup = proxy
+                    .get_capabilities()
+                    .await
+                    .map(|caps| caps.iter().any(|c| c == "body-markup"))
+                    .unwrap_or(true);
+                debug_log!(
+                    crate::debug::NOTIFY,
+                    "notification proxy ready (body markup: {markup})"
+                );
+                Some(Self { proxy, markup })
             }
             Err(e) => {
                 debug_log!(crate::debug::NOTIFY, "no notification service: {e}");
@@ -95,6 +117,50 @@ impl Notifier {
         self.send(
             replaces,
             "drive-removable-media-usb-symbolic",
+            &summary,
+            &body,
+            &actions,
+            hints,
+            NOTIFY_PROMPT_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    /// Ask the user about a Thunderbolt device waiting to be allowed.
+    ///
+    /// Never expires, for the same reason as [`Notifier::prompt`]: the device
+    /// stays without PCIe access until someone decides, and a prompt that
+    /// quietly disappears leaves a dock that "does not work" and no reason.
+    pub async fn thunderbolt_prompt(&self, device: &crate::thunderbolt::Device) -> Option<u32> {
+        let summary = crate::fl!("notify-thunderbolt");
+        let body = crate::fl!("notify-thunderbolt-body", name = device.display_name());
+
+        let urgency = Value::from(2u8); // critical
+        let category = Value::from("device.added");
+        let desktop_entry = Value::from(APP_ID);
+        let mut hints: HashMap<&str, &Value<'_>> = HashMap::new();
+        hints.insert("urgency", &urgency);
+        hints.insert("category", &category);
+        hints.insert("desktop-entry", &desktop_entry);
+
+        let once = crate::fl!("allow-once");
+        let always = crate::fl!("always-allow");
+        let details = crate::fl!("details");
+        let actions = [
+            ACTION_ALLOW_ONCE,
+            once.as_str(),
+            ACTION_ALWAYS_ALLOW,
+            always.as_str(),
+            ACTION_DETAILS,
+            details.as_str(),
+        ];
+
+        // The app's own icon: it is installed into hicolor, which every theme
+        // falls back to, where no Thunderbolt glyph is reliably available.
+        let icon = format!("{APP_ID}-symbolic");
+        self.send(
+            0,
+            &icon,
             &summary,
             &body,
             &actions,
@@ -164,6 +230,11 @@ impl Notifier {
         hints: HashMap<&str, &Value<'_>>,
         timeout: i32,
     ) -> Option<u32> {
+        let body = if self.markup {
+            escape_markup(body)
+        } else {
+            body.to_string()
+        };
         match self
             .proxy
             .notify(
@@ -171,7 +242,7 @@ impl Notifier {
                 replaces,
                 icon,
                 summary,
-                body,
+                &body,
                 actions,
                 hints,
                 timeout,
@@ -240,6 +311,23 @@ fn prompt_body(device: &Device) -> String {
     lines.join("\n")
 }
 
+/// Escape the characters a notification server treats as markup.
+///
+/// The body-markup subset is a few HTML tags and entities, so `&`, `<` and `>`
+/// are all it takes to make device text inert.
+fn escape_markup(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -271,10 +359,31 @@ mod tests {
     }
 
     #[test]
+    fn device_text_cannot_become_notification_markup() {
+        let name = r#"Receiver<a href="https://x">update firmware</a><!--"#;
+        let escaped = escape_markup(name);
+        assert!(
+            !escaped.contains('<') && !escaped.contains('>'),
+            "{escaped}"
+        );
+        assert_eq!(escape_markup("A & B"), "A &amp; B");
+        // Escaping is not applied twice by accident elsewhere: plain text is
+        // left alone.
+        assert_eq!(escape_markup("SanDisk 3.2Gen1"), "SanDisk 3.2Gen1");
+    }
+
+    #[test]
     fn every_notification_action_key_is_distinct() {
         // Two actions sharing a key would silently make one of them do the
-        // other's job — and one of these authorises a device.
-        let keys = [ACTION_ALLOW, ACTION_BLOCK, ACTION_DETAILS, ACTION_MANAGE];
+        // other's job — and one of these authorizes a device.
+        let keys = [
+            ACTION_ALLOW,
+            ACTION_BLOCK,
+            ACTION_DETAILS,
+            ACTION_MANAGE,
+            ACTION_ALLOW_ONCE,
+            ACTION_ALWAYS_ALLOW,
+        ];
         let unique: std::collections::HashSet<_> = keys.iter().collect();
         assert_eq!(unique.len(), keys.len(), "duplicate action key in {keys:?}");
     }

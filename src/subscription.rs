@@ -25,6 +25,18 @@ pub fn usbguard_events() -> Subscription<Event> {
     })
 }
 
+/// A tick whenever bolt reports a Thunderbolt change.
+///
+/// Only subscribed on machines with Thunderbolt or USB4; see
+/// [`crate::thunderbolt::events`].
+pub fn thunderbolt_events() -> Subscription<()> {
+    Subscription::run(|| {
+        stream::channel(8, |mut output| async move {
+            crate::thunderbolt::events::pump(&mut output).await;
+        })
+    })
+}
+
 /// Ticks on which to re-read devices, policy and health.
 ///
 /// Neither systemd unit state nor daemon parameters signal a change, so they

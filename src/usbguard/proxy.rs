@@ -51,7 +51,7 @@ pub trait UsbGuard {
     ) -> zbus::Result<()>;
 }
 
-/// `org.usbguard.Devices1` — the device list and authorisation decisions.
+/// `org.usbguard.Devices1` — the device list and authorization decisions.
 #[zbus::proxy(
     interface = "org.usbguard.Devices1",
     default_service = "org.usbguard1",
@@ -65,7 +65,7 @@ pub trait Devices {
     #[zbus(name = "listDevices")]
     fn list_devices(&self, query: &str) -> zbus::Result<Vec<(u32, String)>>;
 
-    /// Authorise, de-authorise or reject a device.
+    /// Authorize, de-authorize or reject a device.
     ///
     /// `target` uses USBGuard's numbering (see
     /// [`Target::to_dbus`](super::rule::Target::to_dbus)). When `permanent` is
@@ -85,7 +85,7 @@ pub trait Devices {
         attributes: HashMap<String, String>,
     ) -> zbus::Result<()>;
 
-    /// A device's authorisation changed.
+    /// A device's authorization changed.
     #[zbus(signal, name = "DevicePolicyChanged")]
     fn device_policy_changed(
         &self,
@@ -144,7 +144,7 @@ pub trait Policy {
     default_path = "/org/freedesktop/PolicyKit1/Authority"
 )]
 pub trait Polkit {
-    /// Whether `subject` is authorised for `action_id`.
+    /// Whether `subject` is authorized for `action_id`.
     ///
     /// Returns `(authorized, challenge, details)`. `challenge` means the
     /// action is permitted but only after the user authenticates, which is a
@@ -226,6 +226,9 @@ pub trait Notifications {
 
     /// Withdraw a notification by ID.
     fn close_notification(&self, id: u32) -> zbus::Result<()>;
+
+    /// What the server supports, e.g. `body-markup` and `actions`.
+    fn get_capabilities(&self) -> zbus::Result<Vec<String>>;
 
     /// The user activated one of a notification's actions.
     #[zbus(signal)]

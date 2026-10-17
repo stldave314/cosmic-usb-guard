@@ -40,7 +40,7 @@ pub enum Event {
         /// What happened to it.
         event: PresenceEvent,
     },
-    /// A device's authorisation changed, whoever changed it.
+    /// A device's authorization changed, whoever changed it.
     ///
     /// This fires for decisions made in this app, in another USBGuard
     /// front-end, on the command line, or automatically by the daemon's own
@@ -48,9 +48,9 @@ pub enum Event {
     Policy {
         /// The device the decision concerns.
         device: Device,
-        /// Authorisation before the change.
+        /// Authorization before the change.
         old: Target,
-        /// Authorisation after the change.
+        /// Authorization after the change.
         new: Target,
         /// ID of the policy rule that caused it, if any.
         rule_id: u32,

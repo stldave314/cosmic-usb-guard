@@ -91,6 +91,7 @@ fn all_icons() -> Vec<(&'static str, &'static str)> {
         ("BLOCKED", icons::BLOCKED),
         ("REMOVE", icons::REMOVE),
         ("COPY", icons::COPY),
+        ("CLOSE", icons::CLOSE),
         ("REFRESH", icons::REFRESH),
         ("QUIT", icons::QUIT),
         ("HOOK", icons::HOOK),
@@ -222,4 +223,97 @@ fn panel_icons_are_distinct() {
     assert_ne!(icons::PANEL_OK, icons::PANEL_WARNING);
     assert_ne!(icons::PANEL_WARNING, icons::PANEL_CRITICAL);
     assert_ne!(icons::PANEL_OK, icons::PANEL_CRITICAL);
+}
+
+/// The theme COSMIC renders named icons from.
+const COSMIC_THEME: &str = "Cosmic";
+
+/// Cosmic, the themes it inherits directly, and hicolor.
+///
+/// Measured rather than assumed: on a COSMIC desktop a name found in a theme
+/// Cosmic inherits from (Pop) rendered, while one found only further up the
+/// chain (Adwaita, which Pop inherits) rendered as a blank square. The
+/// Adwaita baseline above passes such a name, which is how
+/// `thunderbolt-symbolic` reached the navigation bar invisible.
+fn cosmic_roots() -> Option<Vec<PathBuf>> {
+    let roots = icon_roots();
+    let cosmic = roots
+        .iter()
+        .map(|root| root.join(COSMIC_THEME))
+        .find(|path| path.join("index.theme").is_file())?;
+
+    let index = std::fs::read_to_string(cosmic.join("index.theme")).ok()?;
+    let inherits: Vec<String> = index
+        .lines()
+        .find_map(|line| line.strip_prefix("Inherits="))
+        .map(|list| list.split(',').map(|t| t.trim().to_string()).collect())
+        .unwrap_or_default();
+
+    let mut chain = vec![cosmic];
+    for theme in inherits.iter().map(String::as_str).chain(["hicolor"]) {
+        chain.extend(
+            roots
+                .iter()
+                .map(|root| root.join(theme))
+                .filter(|path| path.is_dir()),
+        );
+    }
+    Some(chain)
+}
+
+#[test]
+fn every_icon_name_resolves_in_the_theme_cosmic_renders_with() {
+    let Some(chain) = cosmic_roots() else {
+        // Not a silent skip: without the theme this check cannot run, so it
+        // fails unless told explicitly that its absence is expected — which CI
+        // does, on a stock runner with no COSMIC theme to check against.
+        assert!(
+            std::env::var_os("ICON_TEST_WITHOUT_COSMIC").is_some(),
+            "the {COSMIC_THEME} icon theme is not installed, so this cannot check \
+             what COSMIC will render; install it, or set ICON_TEST_WITHOUT_COSMIC=1 \
+             to run the other icon checks without it"
+        );
+        return;
+    };
+
+    fn search(dir: &Path, name: &str, depth: usize) -> bool {
+        if depth > 6 {
+            return false;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return false;
+        };
+        entries.filter_map(Result::ok).any(|entry| {
+            let path = entry.path();
+            if path.is_dir() {
+                search(&path, name, depth + 1)
+            } else {
+                path.file_stem().and_then(|s| s.to_str()) == Some(name)
+                    && matches!(
+                        path.extension().and_then(|e| e.to_str()),
+                        Some("svg" | "png" | "xpm")
+                    )
+            }
+        })
+    }
+
+    // Fixture guard: an icon COSMIC is known to render.
+    assert!(
+        chain
+            .iter()
+            .any(|dir| search(dir, "dialog-warning-symbolic", 0)),
+        "the {COSMIC_THEME} theme chain {chain:?} has no control icon"
+    );
+
+    let missing: Vec<String> = all_icons()
+        .into_iter()
+        .filter(|(_, name)| !chain.iter().any(|dir| search(dir, name, 0)))
+        .map(|(constant, name)| format!("{constant} = {name}"))
+        .collect();
+
+    assert!(
+        missing.is_empty(),
+        "these icon names are not in the theme COSMIC renders with and would show \
+         as blank squares there: {missing:#?}"
+    );
 }

@@ -13,36 +13,86 @@ pub mod health;
 pub mod history;
 pub mod icons;
 pub mod settings;
+pub mod thunderbolt;
 
 use crate::usbguard::{DeviceKey, Target};
 
-/// Text colour for something that succeeded or is permitted.
+/// Text color for something that succeeded or is permitted.
 ///
 /// `cosmic::theme::Text` only carries `Accent`, `Default` and an explicit
-/// colour, so the semantic palette entries are resolved from the active theme
+/// color, so the semantic palette entries are resolved from the active theme
 /// here. Views are rebuilt when the theme changes, so this stays correct.
 pub fn success_text() -> cosmic::theme::Text {
     cosmic::theme::Text::Color(cosmic::theme::active().cosmic().success_text_color().into())
 }
 
-/// Text colour for a warning.
+/// Text color for a warning.
 pub fn warning_text() -> cosmic::theme::Text {
     cosmic::theme::Text::Color(cosmic::theme::active().cosmic().warning_text_color().into())
 }
 
 /// The button style for a clickable list row.
 ///
-/// A button sets the text colour for everything inside it. `Button::Transparent`
-/// sounds like "no styling" but its foreground colour is literally
+/// A button sets the text color for everything inside it. `Button::Transparent`
+/// sounds like "no styling" but its foreground color is literally
 /// `rgba(0, 0, 0, 0)`, so every label inside one renders invisible unless it
-/// overrides its own colour — which is not a thing the compiler or a headless
+/// overrides its own color — which is not a thing the compiler or a headless
 /// test would notice. `Button::ListItem` is the style actually intended for
 /// this, and `tests::a_list_row_never_renders_its_text_invisible` pins it.
 pub fn list_row_style() -> cosmic::theme::Button {
     cosmic::theme::Button::ListItem(cosmic::theme::active().cosmic().corner_radii.radius_s)
 }
 
-/// Text colour for something blocked, failed, or destructive.
+/// A dismissible message saying that something the user asked for failed.
+///
+/// A card with the theme's own foreground, not `cosmic::widget::warning`. That
+/// widget paints `warning.on` text over the `warning` color, and a theme is
+/// free to make those two nearly the same — under one such theme the message
+/// rendered as white on pale gray, so the only explanation of a failure was
+/// the one thing on the page that could not be read. A card's text color is
+/// defined as the one that contrasts with its background, and
+/// `tests::an_error_banner_is_readable` pins that.
+///
+/// Generic over the message type because dismissing is the application's
+/// business rather than an [`Action`].
+pub fn error_banner<'a, Message: Clone + 'static>(
+    message: String,
+    on_close: Message,
+) -> cosmic::Element<'a, Message> {
+    use cosmic::iced::{Alignment, Length};
+    use cosmic::widget::{button, container, icon, row, text};
+
+    let space = cosmic::theme::active().cosmic().spacing;
+
+    let content = row::with_capacity(3)
+        .push(
+            icon::from_name(icons::ERROR)
+                .size(20)
+                .icon()
+                .class(cosmic::theme::Svg::custom(|theme| {
+                    cosmic::widget::svg::Style {
+                        color: Some(theme.cosmic().destructive_text_color().into()),
+                    }
+                })),
+        )
+        .push(text::body(message).width(Length::Fill))
+        .push(button::icon(icon::from_name(icons::CLOSE).size(16)).on_press(on_close))
+        .align_y(Alignment::Center)
+        .spacing(space.space_xs);
+
+    container(content)
+        .padding(space.space_xs)
+        .class(error_banner_style())
+        .width(Length::Fill)
+        .into()
+}
+
+/// The container style behind [`error_banner`].
+fn error_banner_style() -> cosmic::theme::Container<'static> {
+    cosmic::theme::Container::Card
+}
+
+/// Text color for something blocked, failed, or destructive.
 pub fn danger_text() -> cosmic::theme::Text {
     cosmic::theme::Text::Color(
         cosmic::theme::active()
@@ -55,7 +105,7 @@ pub fn danger_text() -> cosmic::theme::Text {
 /// Something the user asked for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
-    /// Apply an authorisation decision to a device.
+    /// Apply an authorization decision to a device.
     Decide {
         /// Which device.
         key: DeviceKey,
@@ -64,8 +114,17 @@ pub enum Action {
         /// Whether to write a standing rule as well.
         ///
         /// Always true for a device that is not plugged in: there is nothing
-        /// to authorise now, so a rule is the only thing a decision can be.
+        /// to authorize now, so a rule is the only thing a decision can be.
         permanent: bool,
+        /// Whether a permanent rule is bound to the device's current port.
+        bind: bool,
+    },
+    /// Bind a device's standing rule to its current port, or release it.
+    SetBound {
+        /// Which device.
+        key: DeviceKey,
+        /// Bound or not.
+        bound: bool,
     },
     /// Remove the standing rule for a device and block it now.
     Revoke {
@@ -116,6 +175,13 @@ pub enum Action {
     Select(Option<DeviceKey>),
     /// Change whether the next decision is written as a standing rule.
     SetPermanent(bool),
+    /// Turn "bind to this port" on or off in one device's prompt.
+    SetBind {
+        /// Daemon-assigned ID of the device the prompt is for.
+        device_id: u32,
+        /// On or off.
+        bind: bool,
+    },
     /// Stop asking about a device without deciding anything.
     ///
     /// The device stays exactly as USBGuard left it — blocked — so this
@@ -136,6 +202,28 @@ pub enum Action {
     ClearHistory,
     /// Copy a suggested fix-it command to the clipboard.
     CopyRemedy(String),
+    /// Allow a Thunderbolt device for this connection only.
+    ThunderboltAuthorize {
+        /// bolt's UID for the device.
+        uid: String,
+    },
+    /// Allow a Thunderbolt device and have bolt remember it.
+    ThunderboltEnroll {
+        /// bolt's UID for the device.
+        uid: String,
+    },
+    /// Have bolt forget a Thunderbolt device.
+    ThunderboltForget {
+        /// bolt's UID for the device.
+        uid: String,
+    },
+    /// Stop asking about a Thunderbolt device without allowing it.
+    ThunderboltDismiss {
+        /// bolt's UID for the device.
+        uid: String,
+    },
+    /// Go to the Status page, where problems are explained with their fixes.
+    ShowStatus,
     /// Launch the main window from the applet.
     OpenApp,
     /// Quit.
@@ -223,7 +311,7 @@ pub enum HistoryFilter {
     /// Everything, including devices coming and going.
     #[default]
     All,
-    /// Only entries that record an authorisation decision.
+    /// Only entries that record an authorization decision.
     Decisions,
 }
 
@@ -233,9 +321,60 @@ mod tests {
     use crate::config::Settings;
     use cosmic::widget::button::Catalog;
 
-    /// Resolve a button style's text colour the way the renderer would.
-    fn text_colour(class: &cosmic::theme::Button) -> Option<cosmic::iced::Color> {
+    /// Resolve a button style's text color the way the renderer would.
+    fn text_color(class: &cosmic::theme::Button) -> Option<cosmic::iced::Color> {
         cosmic::Theme::dark().active(false, false, class).text_color
+    }
+
+    /// WCAG relative luminance of an opaque color.
+    fn luminance(color: cosmic::iced::Color) -> f32 {
+        let channel = |c: f32| {
+            if c <= 0.04045 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * channel(color.r) + 0.7152 * channel(color.g) + 0.0722 * channel(color.b)
+    }
+
+    /// WCAG contrast ratio between two colors, from 1 (identical) to 21.
+    fn contrast(a: cosmic::iced::Color, b: cosmic::iced::Color) -> f32 {
+        let (a, b) = (luminance(a), luminance(b));
+        (a.max(b) + 0.05) / (a.min(b) + 0.05)
+    }
+
+    #[test]
+    fn an_error_banner_is_readable() {
+        use cosmic::iced::Background;
+        use cosmic::widget::container::Catalog;
+
+        // Control: the arithmetic can tell unreadable from readable.
+        let white = cosmic::iced::Color::WHITE;
+        let pale = cosmic::iced::Color::from_rgb(0.85, 0.85, 0.85);
+        assert!(contrast(white, pale) < 2.0);
+        assert!(contrast(white, cosmic::iced::Color::BLACK) > 20.0);
+
+        for (name, theme) in [
+            ("dark", cosmic::Theme::dark()),
+            ("light", cosmic::Theme::light()),
+            ("dark high contrast", cosmic::Theme::dark_hc()),
+            ("light high contrast", cosmic::Theme::light_hc()),
+        ] {
+            let style = theme.style(&error_banner_style());
+            let text = style
+                .text_color
+                .unwrap_or_else(|| theme.cosmic().on_bg_color().into());
+            let Some(Background::Color(background)) = style.background else {
+                panic!("the error banner has no solid background under the {name} theme");
+            };
+            // 4.5 is the WCAG AA threshold for body text.
+            let ratio = contrast(text, background);
+            assert!(
+                ratio >= 4.5,
+                "error banner text has a contrast ratio of {ratio:.2} under the {name} theme"
+            );
+        }
     }
 
     #[test]
@@ -244,7 +383,7 @@ mod tests {
         // is the style that shipped first, and it makes every label inside the
         // row fully transparent. If this assertion ever stops holding, the one
         // below has stopped meaning anything.
-        let transparent = text_colour(&cosmic::theme::Button::Transparent);
+        let transparent = text_color(&cosmic::theme::Button::Transparent);
         assert_eq!(
             transparent.map(|c| c.a),
             Some(0.0),
@@ -253,13 +392,13 @@ mod tests {
         );
 
         // The real assertion: the style the device list actually uses must
-        // either inherit the surrounding text colour or set a visible one.
-        match text_colour(&list_row_style()) {
+        // either inherit the surrounding text color or set a visible one.
+        match text_color(&list_row_style()) {
             None => {}
-            Some(colour) => assert!(
-                colour.a > 0.0,
+            Some(color) => assert!(
+                color.a > 0.0,
                 "the device list row renders its text at alpha {}, which is invisible",
-                colour.a
+                color.a
             ),
         }
     }

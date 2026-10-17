@@ -13,7 +13,7 @@
 //!   user's script for anything claiming those IDs, which is precisely the
 //!   substitution USBGuard exists to catch — and it would turn a spoofed
 //!   vendor/product pair into arbitrary code execution.
-//! * **Only after the device is authorised.** [`Hook::should_run`] requires a
+//! * **Only after the device is authorized.** [`Hook::should_run`] requires a
 //!   live [`Target::Allow`]. A device that is blocked, rejected, or still
 //!   awaiting a decision never runs anything, so the hook is always behind the
 //!   same gate as the device.
@@ -45,6 +45,16 @@ pub const ENV_SERIAL: &str = "USBGUARD_DEVICE_SERIAL";
 pub const ENV_PORT: &str = "USBGUARD_DEVICE_PORT";
 /// Environment variable carrying the comma-separated interface class names.
 pub const ENV_CLASSES: &str = "USBGUARD_DEVICE_CLASSES";
+
+/// Every variable a hook is given, in the order the hook editor lists them.
+pub const ENV_ALL: [&str; 6] = [
+    ENV_NAME,
+    ENV_USB_ID,
+    ENV_SERIAL,
+    ENV_HASH,
+    ENV_PORT,
+    ENV_CLASSES,
+];
 
 /// A program to run when one specific device is connected and allowed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,10 +89,16 @@ fn default_true() -> bool {
 pub enum Skip {
     /// The hook is switched off.
     Disabled,
-    /// The device is not authorised, so nothing runs.
+    /// The device is not authorized, so nothing runs.
     NotAllowed,
     /// No program has been set.
     NoProgram,
+    /// The program is not an absolute path.
+    ///
+    /// A bare name would be looked up on `$PATH`, so what runs would depend
+    /// on the environment the app was started in rather than on what the
+    /// user chose.
+    RelativeProgram,
 }
 
 impl Hook {
@@ -108,6 +124,9 @@ impl Hook {
         }
         if self.program.as_os_str().is_empty() {
             return Err(Skip::NoProgram);
+        }
+        if !self.program.is_absolute() {
+            return Err(Skip::RelativeProgram);
         }
         if device.target != Target::Allow {
             return Err(Skip::NotAllowed);
@@ -248,6 +267,28 @@ pub async fn run(hook: &Hook, device: &Device) -> Outcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_relative_program_is_refused_when_it_would_run() {
+        // The editor only warned; the hook still ran whatever `$PATH` found.
+        let device = Device::from_rule(1, r#"allow hash "H=""#).unwrap();
+        let mut hook = Hook::new("H=".into());
+        hook.program = PathBuf::from("backup.sh");
+        assert_eq!(hook.should_run(&device), Err(Skip::RelativeProgram));
+        hook.program = PathBuf::from("/usr/bin/true");
+        assert_eq!(hook.should_run(&device), Ok(()));
+    }
+
+    #[test]
+    fn the_editor_lists_exactly_the_variables_a_hook_receives() {
+        // The editor used to name one variable while hooks received six.
+        let device = Device::from_rule(1, r#"allow hash "H=""#).unwrap();
+        let mut given: Vec<&str> = environment(&device).into_keys().collect();
+        let mut listed = ENV_ALL.to_vec();
+        given.sort_unstable();
+        listed.sort_unstable();
+        assert_eq!(given, listed);
+    }
 
     fn device(target: &str) -> Device {
         Device::from_rule(

@@ -8,7 +8,7 @@ use cosmic::{Apply, Element, theme};
 
 use crate::fl;
 use crate::state::State;
-use crate::usbguard::{Check, Severity};
+use crate::usbguard::{Check, CheckGroup, Severity};
 
 use super::Action;
 use super::format;
@@ -26,7 +26,7 @@ fn severity_class(severity: Severity) -> theme::Text {
     }
 }
 
-/// A one-line banner summarising protection status.
+/// A one-line banner summarizing protection status.
 ///
 /// Shown at the top of both the applet popup and the main window, because a
 /// device list is meaningless if the daemon behind it is not running.
@@ -73,25 +73,69 @@ pub fn banner<'a>(state: &State) -> Option<Element<'a, Action>> {
     Some(alert(
         worst,
         format::status_headline(worst),
-        problem.as_ref().map(|check| format::check_label(check.id)),
-        problem.as_ref().and_then(|check| check.remedy.clone()),
+        problem.as_ref().map(|check| {
+            // The label alone names the check, phrased as what should be
+            // true, which under a warning heading reads like reassurance.
+            // What was actually observed is what says what is wrong.
+            if check.detail.is_empty() {
+                format::check_label(check.id)
+            } else {
+                format!(
+                    "{} — {}",
+                    format::check_label(check.id),
+                    fl!("check-observed", value = check.detail.clone())
+                )
+            }
+        }),
+        problem
+            .as_ref()
+            .and_then(|check| match (&check.remedy, check.steps) {
+                (Some(command), _) => Some(Fix::Command(
+                    command.clone(),
+                    format::remedy_caution(check.id),
+                )),
+                (None, Some(steps)) => Some(Fix::Steps(steps)),
+                (None, None) => None,
+            }),
     ))
+}
+
+/// What the banner offers for the problem it shows.
+enum Fix {
+    /// A command to copy, and a warning to read before running it.
+    Command(String, Option<String>),
+    /// Steps to follow, which are too long for a banner and live on the
+    /// Status page.
+    Steps(crate::usbguard::Steps),
 }
 
 fn alert<'a>(
     severity: Severity,
     heading: String,
     detail: Option<String>,
-    remedy: Option<String>,
+    fix: Option<Fix>,
 ) -> Element<'a, Action> {
     let space = spacing();
 
-    let mut body = column::with_capacity(3)
+    let mut body = column::with_capacity(4)
         .push(text::body(heading).class(severity_class(severity)))
         .spacing(space.space_xxxs);
 
     if let Some(detail) = detail {
         body = body.push(text::caption(detail));
+    }
+
+    // A bare "Copy" next to a problem says nothing about what is copied or
+    // what to do with it.
+    match &fix {
+        Some(Fix::Command(_, caution)) => {
+            if let Some(caution) = caution {
+                body = body.push(text::caption(caution.clone()).class(super::warning_text()));
+            }
+            body = body.push(text::caption(fl!("remedy-explanation")));
+        }
+        Some(Fix::Steps(steps)) => body = body.push(text::caption(format::steps_intro(*steps))),
+        None => {}
     }
 
     let mut content = row::with_capacity(3)
@@ -100,12 +144,22 @@ fn alert<'a>(
         .align_y(Alignment::Center)
         .spacing(space.space_xs);
 
-    if let Some(remedy) = remedy {
-        content = content.push(
-            button::standard(fl!("copy"))
-                .on_press(Action::CopyRemedy(remedy))
-                .padding(space.space_xxs),
-        );
+    match fix {
+        Some(Fix::Command(command, _)) => {
+            content = content.push(
+                button::standard(fl!("copy-command"))
+                    .on_press(Action::CopyRemedy(command))
+                    .padding(space.space_xxs),
+            );
+        }
+        Some(Fix::Steps(_)) => {
+            content = content.push(
+                button::standard(fl!("tb-open-status"))
+                    .on_press(Action::ShowStatus)
+                    .padding(space.space_xxs),
+            );
+        }
+        None => {}
     }
 
     container(content)
@@ -119,7 +173,7 @@ fn alert<'a>(
 fn check_row<'a>(check: &Check) -> Element<'a, Action> {
     let space = spacing();
 
-    let mut body = column::with_capacity(3)
+    let mut body = column::with_capacity(12)
         .push(text::body(format::check_label(check.id)))
         .spacing(space.space_xxxs);
 
@@ -131,6 +185,9 @@ fn check_row<'a>(check: &Check) -> Element<'a, Action> {
     }
 
     if let Some(remedy) = check.remedy.as_ref() {
+        if let Some(caution) = format::remedy_caution(check.id) {
+            body = body.push(text::caption(caution).class(super::warning_text()));
+        }
         body = body.push(text::caption(fl!("remedy-heading")));
         body = body.push(
             row::with_capacity(2)
@@ -142,6 +199,17 @@ fn check_row<'a>(check: &Check) -> Element<'a, Action> {
                 .align_y(Alignment::Center)
                 .spacing(space.space_xxs),
         );
+        body = body.push(text::caption(fl!("remedy-explanation")));
+    }
+
+    // No command can change a firmware setting; say so, then say how.
+    if let Some(steps) = check.steps {
+        body = body
+            .push(text::caption(format::steps_intro(steps)))
+            .push(text::caption(format::steps_heading(steps)));
+        for step in format::steps(steps) {
+            body = body.push(text::caption(step));
+        }
     }
 
     row::with_capacity(2)
@@ -193,11 +261,34 @@ pub fn view<'a>(state: &State) -> Element<'a, Action> {
     if state.health.checks.is_empty() {
         content = content.push(text::body(fl!("status-checking")));
     } else {
-        let mut checks = column::with_capacity(state.health.checks.len());
-        for check in &state.health.checks {
-            checks = checks.push(check_row(check));
+        // Grouped, so a Thunderbolt problem is not read as a USBGuard one. The
+        // heading only appears once there is more than one group to tell
+        // apart.
+        let groups = [CheckGroup::UsbGuard, CheckGroup::Thunderbolt];
+        let present: Vec<CheckGroup> = groups
+            .into_iter()
+            .filter(|g| state.health.checks.iter().any(|c| c.id.group() == *g))
+            .collect();
+
+        for group in &present {
+            let mut checks = column::with_capacity(state.health.checks.len() + 1);
+            if present.len() > 1 {
+                checks = checks.push(
+                    text::heading(format::check_group_label(*group))
+                        .apply(container)
+                        .padding([space.space_xxs, space.space_xs]),
+                );
+            }
+            for check in state
+                .health
+                .checks
+                .iter()
+                .filter(|c| c.id.group() == *group)
+            {
+                checks = checks.push(check_row(check));
+            }
+            content = content.push(checks);
         }
-        content = content.push(checks);
     }
 
     content.into()

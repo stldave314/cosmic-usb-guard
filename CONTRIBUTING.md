@@ -54,7 +54,7 @@ stray English elsewhere rather than as a build error.
 A few conventions this codebase holds to. They are not arbitrary; each one
 exists because the alternative caused a real problem.
 
-**Prove security-relevant behaviour against a running system.** Reading the
+**Prove security-relevant behavior against a running system.** Reading the
 code is not evidence. A control can be present, valid, reviewed and completely
 inert. Everything in `usbguard::health` is an empirical probe for this reason,
 and `scripts/verify-release-build.sh` builds the binary both ways rather than
@@ -71,7 +71,7 @@ though the answer were the one that prompts the user, not the one that stays
 quiet. See `State::has_standing_rule`.
 
 **Never present stale state as current.** When the daemon goes away the device
-list is cleared rather than left on screen; showing yesterday's authorisations
+list is cleared rather than left on screen; showing yesterday's authorizations
 as though they were live is worse than showing nothing.
 
 **User-facing strings go through `fl!`.** No hardcoded English in the UI,
@@ -95,11 +95,11 @@ version-bumping.
 Write a body explaining *why*, not what — the diff already says what.
 
 Keep the README current in the same commit as the change. If a feature is added
-or observable behaviour changes, the feature list, settings table, usage and
+or observable behavior changes, the feature list, settings table, usage and
 troubleshooting sections need to match. If nothing user-visible changed, say so
 rather than leaving it silently stale.
 
-## Licence
+## License
 
 By contributing you agree that your work is licensed under GPL-3.0-or-later,
 the same as the project.

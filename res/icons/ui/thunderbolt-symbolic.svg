@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<!-- Symbolic Thunderbolt glyph, compiled into the app rather than looked up:
+     no icon theme COSMIC follows ships one. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <path fill="#2e3436" d="M9.75 .75 3.25 9.25h4.25L6.25 15.25l6.5-8.5H8.5z"/>
+</svg>

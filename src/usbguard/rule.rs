@@ -18,6 +18,7 @@
 //! written `{ a b c }` and optionally preceded by a set operator.
 
 use std::fmt;
+use std::ops::Range;
 
 /// A single token of a rule string.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,57 +81,73 @@ impl fmt::Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
-/// Split a rule string into tokens, honouring quotes, escapes and set braces.
+/// Split a rule string into tokens, honoring quotes, escapes and set braces.
 fn tokenize(input: &str) -> Result<Vec<Token>, ParseError> {
-    let mut tokens = Vec::new();
-    let mut chars = input.chars().peekable();
+    Ok(tokenize_spanned(input)?
+        .into_iter()
+        .map(|(token, _)| token)
+        .collect())
+}
 
-    while let Some(&c) = chars.peek() {
+/// [`tokenize`], with the byte range each token occupies in `input`.
+///
+/// The ranges are what make it possible to edit one attribute of a rule while
+/// leaving every other byte exactly as the daemon wrote it. Re-serializing
+/// from parsed values instead would lose information the tokens no longer
+/// carry — which values were quoted, and how a non-ASCII name was escaped —
+/// and a rule whose name no longer matches byte for byte matches nothing.
+fn tokenize_spanned(input: &str) -> Result<Vec<(Token, Range<usize>)>, ParseError> {
+    let mut tokens = Vec::new();
+    let mut chars = input.char_indices().peekable();
+
+    while let Some(&(start, c)) = chars.peek() {
         match c {
             c if c.is_whitespace() => {
                 chars.next();
             }
             '{' => {
                 chars.next();
-                tokens.push(Token::SetOpen);
+                tokens.push((Token::SetOpen, start..start + 1));
             }
             '}' => {
                 chars.next();
-                tokens.push(Token::SetClose);
+                tokens.push((Token::SetClose, start..start + 1));
             }
             '"' => {
                 chars.next();
                 let mut value = String::new();
-                let mut closed = false;
-                while let Some(c) = chars.next() {
+                let mut end = None;
+                while let Some((at, c)) = chars.next() {
                     match c {
                         '"' => {
-                            closed = true;
+                            end = Some(at + 1);
                             break;
                         }
                         // USBGuard escapes `"` and `\` inside quoted strings.
                         '\\' => match chars.next() {
-                            Some(escaped) => value.push(escaped),
+                            Some((_, escaped)) => value.push(escaped),
                             None => return Err(ParseError::UnterminatedQuote),
                         },
                         other => value.push(other),
                     }
                 }
-                if !closed {
+                let Some(end) = end else {
                     return Err(ParseError::UnterminatedQuote);
-                }
-                tokens.push(Token::Quoted(value));
+                };
+                tokens.push((Token::Quoted(value), start..end));
             }
             _ => {
                 let mut word = String::new();
-                while let Some(&c) = chars.peek() {
+                let mut end = start;
+                while let Some(&(at, c)) = chars.peek() {
                     if c.is_whitespace() || c == '{' || c == '}' || c == '"' {
                         break;
                     }
                     word.push(c);
+                    end = at + c.len_utf8();
                     chars.next();
                 }
-                tokens.push(Token::Word(word));
+                tokens.push((Token::Word(word), start..end));
             }
         }
     }
@@ -138,17 +155,145 @@ fn tokenize(input: &str) -> Result<Vec<Token>, ParseError> {
     Ok(tokens)
 }
 
+/// Where one attribute sits in a rule string.
+struct AttributeSpan {
+    /// Attribute name.
+    name: String,
+    /// Bytes from the start of the name to the end of its value.
+    range: Range<usize>,
+}
+
+/// The attributes of a rule string and the bytes each occupies.
+///
+/// Walks the tokens the same way [`Rule::parse`] does, so a word is only
+/// treated as an attribute name where the parser would treat it as one — a
+/// device named `via-port` is a quoted value, not an attribute.
+fn attribute_spans(input: &str) -> Result<Vec<AttributeSpan>, ParseError> {
+    let tokens = tokenize_spanned(input)?;
+    let mut spans = Vec::new();
+    // The first token is the target keyword.
+    let mut index = 1;
+
+    while index < tokens.len() {
+        let (Token::Word(name), name_range) = &tokens[index] else {
+            index += 1;
+            continue;
+        };
+        let start = name_range.start;
+        index += 1;
+
+        // A condition runs to the end of the rule; see `Rule::parse`.
+        if name == "if" {
+            let Some((_, last)) = tokens.last() else {
+                return Err(ParseError::MissingValue(name.clone()));
+            };
+            if index >= tokens.len() {
+                return Err(ParseError::MissingValue(name.clone()));
+            }
+            spans.push(AttributeSpan {
+                name: name.clone(),
+                range: start..last.end,
+            });
+            break;
+        }
+
+        if let Some((Token::Word(w), _)) = tokens.get(index)
+            && SET_OPERATORS.contains(&w.as_str())
+        {
+            index += 1;
+        }
+
+        let end = match tokens.get(index) {
+            Some((Token::SetOpen, _)) => loop {
+                index += 1;
+                match tokens.get(index) {
+                    Some((Token::SetClose, range)) => break range.end,
+                    Some(_) => {}
+                    None => return Err(ParseError::UnterminatedSet),
+                }
+            },
+            Some((Token::Word(_) | Token::Quoted(_), range)) => range.end,
+            _ => return Err(ParseError::MissingValue(name.clone())),
+        };
+        index += 1;
+
+        spans.push(AttributeSpan {
+            name: name.clone(),
+            range: start..end,
+        });
+    }
+
+    Ok(spans)
+}
+
+/// `rule` with its `via-port` attribute set to `port`, or removed for `None`.
+///
+/// Every other byte of the rule is kept as it was. An existing `via-port` is
+/// replaced where it stands; a new one goes straight after `parent-hash` (or
+/// `hash`), which is where the daemon itself writes it.
+///
+/// Returns `None` when the rule does not parse, or when a port is being added
+/// to a rule with neither hash attribute to anchor it to. Port binding only
+/// ever applies to rules pinned to one device's hash, so that is never a rule
+/// this should be editing.
+pub fn with_via_port(rule: &str, port: Option<&str>) -> Option<String> {
+    let spans = attribute_spans(rule).ok()?;
+    let ports: Vec<&AttributeSpan> = spans.iter().filter(|s| s.name == "via-port").collect();
+
+    let insert_at = match ports.first() {
+        Some(first) => first.range.start,
+        None => {
+            let anchor = spans
+                .iter()
+                .find(|s| s.name == "parent-hash")
+                .or_else(|| spans.iter().find(|s| s.name == "hash"));
+            match (anchor, port) {
+                (Some(anchor), _) => anchor.range.end,
+                (None, None) => return Some(rule.to_string()),
+                (None, Some(_)) => return None,
+            }
+        }
+    };
+
+    let mut out = String::with_capacity(rule.len() + 24);
+    let mut cursor = 0;
+    let mut inserted = false;
+
+    for span in &ports {
+        // Drop the attribute together with the whitespace in front of it, so
+        // removing one leaves single spaces rather than a double gap.
+        let gap_start = rule[..span.range.start].trim_end().len();
+        out.push_str(&rule[cursor..gap_start]);
+        if !inserted && let Some(port) = port {
+            out.push_str(" via-port ");
+            out.push_str(&quote(port));
+            inserted = true;
+        }
+        cursor = span.range.end;
+    }
+
+    if !inserted && let Some(port) = port {
+        out.push_str(&rule[cursor..insert_at]);
+        out.push_str(" via-port ");
+        out.push_str(&quote(port));
+        cursor = insert_at;
+    }
+
+    out.push_str(&rule[cursor..]);
+    Some(out)
+}
+
 /// The action a rule applies to a matching device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Target {
-    /// Device is authorised.
+    /// Device is authorized.
     Allow,
-    /// Device is present but de-authorised.
+    /// Device is present but de-authorized.
     Block,
-    /// Device is de-authorised and removed from the system.
+    /// Device is de-authorized and removed from the system.
     Reject,
-    /// Rule matches without changing authorisation (used by `match` rules).
+    /// Rule matches without changing authorization (used by `match` rules).
     Match,
     /// Target reported by the daemon that this build does not know about.
     Unknown,
@@ -180,7 +325,7 @@ impl Target {
     /// Convert from the integer used by the `Devices1` D-Bus interface.
     ///
     /// The numbering is USBGuard's `Rule::Target` enum: it is stable ABI for
-    /// the D-Bus interface, so an unrecognised value means a newer daemon
+    /// the D-Bus interface, so an unrecognized value means a newer daemon
     /// rather than a bug, and is surfaced as [`Target::Unknown`].
     pub fn from_dbus(value: u32) -> Self {
         match value {
@@ -284,8 +429,29 @@ impl Rule {
                 _ => continue,
             };
 
-            // Conditions (`if <condition>`) are kept verbatim as a single
-            // value; we do not need to interpret them.
+            // A condition (`if <condition>`) is always the last thing in a
+            // rule and can contain spaces, quotes and parentheses, so it takes
+            // everything that follows as one opaque value. Parsing it as
+            // ordinary attributes failed, and the client then skipped the
+            // whole rule — so a rule that could decide about a device before
+            // that device's own rule was invisible to the app.
+            if name == "if" {
+                // The exact text, taken by position: rebuilding it from tokens
+                // would lose its spacing and quoting.
+                let condition = attribute_spans(input)?
+                    .into_iter()
+                    .find(|span| span.name == "if")
+                    .map(|span| {
+                        input[span.range.start + "if".len()..span.range.end]
+                            .trim()
+                            .to_string()
+                    })
+                    .filter(|condition| !condition.is_empty())
+                    .ok_or_else(|| ParseError::MissingValue(name.clone()))?;
+                attributes.push((name, AttributeValue::Single(condition)));
+                break;
+            }
+
             let mut operator = None;
             if let Some(Token::Word(w)) = iter.peek()
                 && SET_OPERATORS.contains(&w.as_str())
@@ -406,6 +572,81 @@ mod tests {
             Some("jEP/6WzviqdJ5VSeTUY8PatCNBKeaREvo2OqdplND/o=")
         );
         assert_eq!(rule.raw, DEVICE_RULE);
+    }
+
+    #[test]
+    fn binding_a_rule_to_a_port_puts_via_port_where_the_daemon_would() {
+        let rule = concat!(
+            r#"allow id 0781:55a9 serial "0000293" name " SanDisk 3.2Gen1" "#,
+            r#"hash "ifdab=" parent-hash "G+G3=" with-interface { 08:06:50 08:06:62 } "#,
+            r#"with-connect-type "hotplug""#
+        );
+        let bound = with_via_port(rule, Some("3-5")).unwrap();
+        assert_eq!(
+            bound,
+            concat!(
+                r#"allow id 0781:55a9 serial "0000293" name " SanDisk 3.2Gen1" "#,
+                r#"hash "ifdab=" parent-hash "G+G3=" via-port "3-5" "#,
+                r#"with-interface { 08:06:50 08:06:62 } with-connect-type "hotplug""#
+            )
+        );
+        assert_eq!(
+            Rule::parse(&bound).unwrap().attribute("via-port"),
+            Some("3-5")
+        );
+
+        // Unbinding is the exact inverse.
+        assert_eq!(with_via_port(&bound, None).unwrap(), rule);
+    }
+
+    #[test]
+    fn rebinding_replaces_the_port_in_place_and_touches_nothing_else() {
+        let moved = with_via_port(DEVICE_RULE, Some("1-2.4")).unwrap();
+        assert_eq!(moved, DEVICE_RULE.replace(r#""usb1""#, r#""1-2.4""#));
+    }
+
+    #[test]
+    fn editing_the_port_keeps_escaped_values_byte_for_byte() {
+        // Re-serializing from parsed values would turn `\x2f` into `x2f`, and
+        // the rewritten rule would no longer match the device's name.
+        let rule = r#"allow name "Odd\x2fName \"quoted\"" hash "H=" via-port "1-1""#;
+        let unbound = with_via_port(rule, None).unwrap();
+        assert_eq!(unbound, r#"allow name "Odd\x2fName \"quoted\"" hash "H=""#);
+    }
+
+    #[test]
+    fn a_value_that_spells_via_port_is_not_mistaken_for_the_attribute() {
+        let rule = r#"allow name "via-port" hash "H=""#;
+        assert_eq!(
+            with_via_port(rule, Some("2-1")).unwrap(),
+            r#"allow name "via-port" hash "H=" via-port "2-1""#
+        );
+    }
+
+    #[test]
+    fn a_port_is_only_added_to_a_rule_pinned_to_a_hash() {
+        assert_eq!(with_via_port("allow id 1234:5678", Some("1-1")), None);
+        // Removing one that is not there is a no-op, not a failure.
+        assert_eq!(
+            with_via_port("allow id 1234:5678", None).as_deref(),
+            Some("allow id 1234:5678")
+        );
+        // Unparseable input is refused rather than half-edited.
+        assert_eq!(with_via_port(r#"allow name "open"#, None), None);
+    }
+
+    #[test]
+    fn a_condition_with_spaces_and_quotes_is_kept_whole() {
+        let rule = Rule::parse(r#"allow id 0781:5567 if !allowed-matches(name "x y")"#).unwrap();
+        assert_eq!(rule.attribute("id"), Some("0781:5567"));
+        assert_eq!(
+            rule.attribute("if"),
+            Some(r#"!allowed-matches(name "x y")"#)
+        );
+
+        // Port editing leaves the condition where it was, at the end.
+        let bound = with_via_port(r#"allow hash "H=" if true"#, Some("1-1")).unwrap();
+        assert_eq!(bound, r#"allow hash "H=" via-port "1-1" if true"#);
     }
 
     #[test]

@@ -2,14 +2,14 @@
 
 ## The short version
 
-Be decent to people. Assume good faith. Criticise code, not the person who
+Be decent to people. Assume good faith. Criticize code, not the person who
 wrote it.
 
 ## What is expected
 
 - Be respectful of differing viewpoints, experience levels and backgrounds.
 - Give and accept constructive feedback gracefully.
-- Take responsibility when you get something wrong, apologise, and move on.
+- Take responsibility when you get something wrong, apologize, and move on.
 - Focus on what is best for the project and the people using it.
 
 ## What is not acceptable

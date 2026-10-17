@@ -25,6 +25,6 @@ pub mod rule;
 
 pub use client::{Client, Error};
 pub use events::Event;
-pub use health::{Check, CheckId, Health, Severity};
+pub use health::{Check, CheckGroup, CheckId, Health, Severity, Steps};
 pub use model::{Device, DeviceKey, Interface, PolicyRule, Presence, PresenceEvent};
 pub use rule::{Rule, Target};

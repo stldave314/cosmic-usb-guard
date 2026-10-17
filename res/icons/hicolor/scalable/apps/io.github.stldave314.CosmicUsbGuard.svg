@@ -9,12 +9,18 @@
     </linearGradient>
   </defs>
   <path fill="url(#shield)" d="M64 6 16 24v40c0 25.6 20 47.2 48 58 28-10.8 48-32.4 48-58V24z"/>
-  <path fill="#1c4270" d="M64 6v98c28-10.8 48-32.4 48-58V24z" opacity=".25"/>
+  <path fill="#1c4270" d="M64 6v116c28-10.8 48-32.4 48-58V24z" opacity=".25"/>
+  <!-- The trident: arrow tip, a round and a square branch end at different
+       heights, and the plug circle at the base. -->
+  <g fill="none" stroke="#ffffff" stroke-width="6" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M64 40v50"/>
+    <path d="M64 82 44 68V58"/>
+    <path d="M64 70 84 56V50"/>
+  </g>
   <g fill="#ffffff">
+    <path d="M64 24 53 42h22z"/>
     <circle cx="64" cy="94" r="9"/>
-    <path d="M60 34h8v52h-8z"/>
-    <path d="M58 26h16v10H58z"/>
-    <path d="M64 62 84 50v-8h10v-12H76v12h4l-16 9.6z"/>
-    <path d="M44 50l8 14h-6v8h14v-8h-6l-4-7z"/>
+    <circle cx="44" cy="54" r="7.5"/>
+    <path d="M77 36h14v14H77z"/>
   </g>
 </svg>

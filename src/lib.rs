@@ -36,6 +36,7 @@ pub mod notify;
 pub mod state;
 pub mod subscription;
 pub mod tasks;
+pub mod thunderbolt;
 pub mod tray;
 pub mod ui;
 pub mod usbguard;

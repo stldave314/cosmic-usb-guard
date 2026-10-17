@@ -118,7 +118,7 @@ pub struct Settings {
     /// Per-device hook programs, keyed by descriptor hash.
     ///
     /// See [`crate::hooks`] for why a hook only ever runs for a device that is
-    /// both configured here and currently authorised.
+    /// both configured here and currently authorized.
     pub hooks: Vec<Hook>,
 
     /// Warn when USBGuard's own configuration would defeat prompting.
@@ -237,7 +237,7 @@ mod tests {
 
     #[test]
     fn defaults_prompt_and_log() {
-        // The whole point of the app is to ask before authorising, and to keep
+        // The whole point of the app is to ask before authorizing, and to keep
         // a record. Both must be on out of the box.
         let settings = Settings::default();
         assert!(settings.prompt_on_insert);

@@ -5,7 +5,7 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-use super::rule::{ParseError, Rule, Target};
+use super::rule::{AttributeValue, ParseError, Rule, Target};
 
 /// Why a device is in the state it is in, as far as we can tell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -19,7 +19,7 @@ pub enum PresenceEvent {
     Update,
     /// Device was unplugged.
     Remove,
-    /// An event code this build does not recognise.
+    /// An event code this build does not recognize.
     Unknown,
 }
 
@@ -184,7 +184,7 @@ pub enum DeviceKey {
 pub struct Device {
     /// Whether the device is plugged in, and its daemon ID if it is.
     pub presence: Presence,
-    /// Current authorisation target.
+    /// Current authorization target.
     pub target: Target,
     /// Vendor ID, as four lowercase hex digits.
     pub vendor_id: String,
@@ -267,7 +267,7 @@ impl Device {
 
     /// The daemon-assigned ID, or `None` when the device is not plugged in.
     ///
-    /// Every call that changes a live device's authorisation goes through
+    /// Every call that changes a live device's authorization goes through
     /// this, so a remembered device cannot reach `applyDevicePolicy` at all.
     pub fn daemon_id(&self) -> Option<u32> {
         match self.presence {
@@ -356,9 +356,19 @@ impl Device {
     /// Whether this looks like a root hub, which is part of the machine rather
     /// than something the user plugged in.
     ///
-    /// Root hubs use the Linux Foundation vendor ID and are hardwired.
+    /// Root hubs use the Linux Foundation vendor ID *and* sit on a bus's root
+    /// port, which the kernel names `usbN`.
+    ///
+    /// The vendor ID alone is something any device can claim. Root hubs are
+    /// hidden by default and never prompted about, so a device claiming
+    /// `1d6b` was blocked by USBGuard with nothing on screen to say it had
+    /// tried. The port is assigned by the kernel, not reported by the device.
     pub fn is_root_hub(&self) -> bool {
         self.vendor_id == "1d6b"
+            && self
+                .via_port
+                .strip_prefix("usb")
+                .is_some_and(|bus| !bus.is_empty() && bus.bytes().all(|b| b.is_ascii_digit()))
     }
 
     /// Whether the device is soldered in or otherwise not user-pluggable.
@@ -370,7 +380,7 @@ impl Device {
     /// descriptor hash.
     ///
     /// Keying on the hash rather than the USB ID matters: a rule written as
-    /// `allow id 0781:5567` authorises every device that claims those IDs,
+    /// `allow id 0781:5567` authorizes every device that claims those IDs,
     /// which is exactly the property a spoofing device relies on.
     pub fn permanent_rule(&self, target: Target) -> Option<String> {
         if self.hash.is_empty() {
@@ -386,7 +396,7 @@ impl Device {
     /// This device's own rule text with a different target.
     ///
     /// Used to change a decision about a device that is not plugged in, where
-    /// there is nothing to authorise now and the rule is the only thing that
+    /// there is nothing to authorize now and the rule is the only thing that
     /// can be rewritten. The rest of the rule is carried over verbatim so the
     /// policy keeps the name, serial and interface list that make it legible;
     /// only the leading target keyword changes.
@@ -410,6 +420,23 @@ impl Device {
     }
 }
 
+impl Device {
+    /// This device's rule with a different target and the port binding set.
+    ///
+    /// `Some(port)` pins the rule to that port, `None` removes any pin. Built
+    /// on [`Device::retargeted_rule`], so the same guarantee holds: only a rule
+    /// pinned to this device's hash is ever produced.
+    pub fn rule_with_port(&self, target: Target, port: Option<&str>) -> Option<String> {
+        let retargeted = self.retargeted_rule(target)?;
+        super::rule::with_via_port(&retargeted, port)
+    }
+
+    /// Whether the device reports a port it can be bound to.
+    pub fn can_bind_port(&self) -> bool {
+        self.is_connected() && !self.via_port.is_empty() && !self.hash.is_empty()
+    }
+}
+
 /// A rule in the daemon's policy, with the ID needed to remove it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyRule {
@@ -428,9 +455,51 @@ impl PolicyRule {
         })
     }
 
-    /// The device hash this rule pins to, if it is a hash rule.
+    /// The device hash this rule pins to, if it pins exactly one.
+    ///
+    /// A rule written `hash one-of { A B }` covers two devices. Treating it
+    /// as device A's would let forgetting or changing A rewrite or delete
+    /// B's rule along with it, so a set of hashes pins no single device.
     pub fn hash(&self) -> Option<&str> {
-        self.rule.attribute("hash")
+        match self
+            .rule
+            .attributes
+            .iter()
+            .find(|(name, _)| name == "hash")?
+        {
+            (_, AttributeValue::Single(hash)) => Some(hash.as_str()),
+            (_, AttributeValue::Set { .. }) => None,
+        }
+    }
+
+    /// Whether this rule could match `device`.
+    ///
+    /// Generous on purpose: it is used to warn that a rule may decide about a
+    /// device before the device's own rule is reached, so an attribute it
+    /// cannot evaluate (a condition, an unfamiliar attribute) counts as a
+    /// possible match rather than a certain miss.
+    pub fn may_match(&self, device: &Device) -> bool {
+        self.rule.attributes.iter().all(|(name, value)| {
+            let field = match name.as_str() {
+                "id" => return id_may_match(value, &device.vendor_id, &device.product_id),
+                "with-interface" => return interfaces_may_match(value, &device.interfaces),
+                "hash" => &device.hash,
+                "parent-hash" => &device.parent_hash,
+                "name" => &device.name,
+                "serial" => &device.serial,
+                "via-port" => &device.via_port,
+                "with-connect-type" => &device.connect_type,
+                // `label` describes, it does not match; anything else is a
+                // condition or something newer than this code.
+                _ => return true,
+            };
+            value_may_match(value, |candidate| candidate == field)
+        })
+    }
+
+    /// The port this rule is bound to, if any.
+    pub fn port(&self) -> Option<&str> {
+        self.rule.attribute("via-port")
     }
 
     /// The device this rule remembers, if it pins one specifically.
@@ -439,9 +508,112 @@ impl PolicyRule {
     }
 }
 
+/// Whether an attribute value could match, given a test for one candidate.
+fn value_may_match(value: &AttributeValue, matches: impl Fn(&str) -> bool) -> bool {
+    match value {
+        AttributeValue::Single(v) => matches(v),
+        AttributeValue::Set { operator, values } => match operator.as_deref() {
+            Some("none-of") => !values.iter().any(|v| matches(v)),
+            // `all-of`, `equals` and the rest need every value to match one
+            // device field, which for a single-valued field means at most one
+            // distinct value; `one-of` needs any. Either way, no candidate
+            // matching is a certain miss, and anything else may match.
+            _ => values.iter().any(|v| matches(v)),
+        },
+    }
+}
+
+/// Whether an `id` attribute (`vvvv:pppp`, either half possibly `*`) could
+/// match the device's IDs.
+fn id_may_match(value: &AttributeValue, vendor: &str, product: &str) -> bool {
+    value_may_match(value, |pattern| {
+        let Some((v, p)) = pattern.split_once(':') else {
+            return true;
+        };
+        (v == "*" || v.eq_ignore_ascii_case(vendor))
+            && (p == "*" || p.eq_ignore_ascii_case(product))
+    })
+}
+
+/// Whether a `with-interface` attribute could match the device's interfaces.
+///
+/// Patterns are `cc:ss:pp` with `*` for any field. A device the policy has
+/// no interface list for may match anything.
+fn interfaces_may_match(value: &AttributeValue, interfaces: &[Interface]) -> bool {
+    if interfaces.is_empty() {
+        return true;
+    }
+    let matches = |pattern: &str| {
+        let fields: Vec<&str> = pattern.split(':').collect();
+        interfaces.iter().any(|interface| {
+            let actual = [interface.class, interface.subclass, interface.protocol];
+            fields.len() == 3
+                && fields.iter().zip(actual).all(|(field, actual)| {
+                    *field == "*" || u8::from_str_radix(field, 16).ok() == Some(actual)
+                })
+        })
+    };
+    value_may_match(value, matches)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn policy_rule(text: &str) -> PolicyRule {
+        PolicyRule::from_pair(1, text).unwrap()
+    }
+
+    #[test]
+    fn a_rule_pinning_a_set_of_hashes_belongs_to_no_single_device() {
+        assert_eq!(policy_rule(r#"allow hash "A=""#).hash(), Some("A="));
+        assert_eq!(
+            policy_rule(r#"allow hash one-of { "A=" "B=" }"#).hash(),
+            None
+        );
+    }
+
+    #[test]
+    fn broad_rules_that_could_match_a_device_are_recognized() {
+        let stick = Device::from_rule(
+            1,
+            r#"block id 0781:5567 serial "S1" name "Cruzer" hash "H=" via-port "1-2" with-interface 08:06:50"#,
+        )
+        .unwrap();
+
+        for broad in [
+            "allow id 0781:5567",
+            "allow id 0781:*",
+            "allow with-interface 08:*:*",
+            "allow with-interface one-of { 03:*:* 08:06:50 }",
+            "allow",
+            r#"allow id 0781:5567 if !allowed-matches(name "x")"#,
+        ] {
+            assert!(policy_rule(broad).may_match(&stick), "{broad}");
+        }
+
+        for unrelated in [
+            "allow id 046d:c31c",
+            "allow with-interface 03:*:*",
+            r#"allow hash "OTHER=""#,
+            r#"allow id 0781:5567 serial "S2""#,
+            "allow with-interface none-of { 08:*:* }",
+        ] {
+            assert!(!policy_rule(unrelated).may_match(&stick), "{unrelated}");
+        }
+    }
+
+    #[test]
+    fn a_device_claiming_the_root_hub_vendor_is_not_treated_as_one() {
+        let real = Device::from_rule(1, r#"allow id 1d6b:0002 via-port "usb3""#).unwrap();
+        assert!(real.is_root_hub());
+
+        // Plugged into an ordinary port, it is a device like any other.
+        let fake = Device::from_rule(2, r#"block id 1d6b:0002 via-port "3-1""#).unwrap();
+        assert!(!fake.is_root_hub());
+        let no_port = Device::from_rule(3, r#"block id 1d6b:0002"#).unwrap();
+        assert!(!no_port.is_root_hub());
+    }
 
     const KEYBOARD: &str = concat!(
         r#"block id 046d:c31c serial "" name "USB Keyboard" "#,
@@ -549,7 +721,7 @@ mod tests {
     fn detects_root_hubs() {
         let hub = Device::from_rule(
             1,
-            r#"allow id 1d6b:0002 with-interface 09:00:00 with-connect-type "hardwired""#,
+            r#"allow id 1d6b:0002 via-port "usb1" with-interface 09:00:00 with-connect-type "hardwired""#,
         )
         .unwrap();
         assert!(hub.is_root_hub());

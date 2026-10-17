@@ -31,11 +31,11 @@ pub enum Kind {
     Removed,
     /// A device's descriptors changed while connected.
     Updated,
-    /// A device was authorised.
+    /// A device was authorized.
     Allowed,
-    /// A device was de-authorised.
+    /// A device was de-authorized.
     Blocked,
-    /// A device was de-authorised and detached.
+    /// A device was de-authorized and detached.
     Rejected,
     /// A standing rule for a device was removed.
     Revoked,
@@ -58,7 +58,7 @@ impl Kind {
         }
     }
 
-    /// Whether this kind records an authorisation decision, as opposed to a
+    /// Whether this kind records an authorization decision, as opposed to a
     /// device merely coming and going.
     pub fn is_decision(self) -> bool {
         matches!(
@@ -84,7 +84,7 @@ pub enum Actor {
 
 /// A device as it was at the moment of the entry.
 ///
-/// Denormalised on purpose: the journal has to stay readable years later, when
+/// Denormalized on purpose: the journal has to stay readable years later, when
 /// the device is long gone and its daemon-assigned ID has been reused.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceSnapshot {
@@ -157,6 +157,26 @@ impl Entry {
         }
     }
 
+    /// An entry about a Thunderbolt device, identified by the name bolt
+    /// reports. It has no USB ID, serial or descriptor hash to record.
+    pub fn thunderbolt(kind: Kind, actor: Actor, name: String) -> Self {
+        Self {
+            timestamp: Utc::now(),
+            kind,
+            actor,
+            device: Some(DeviceSnapshot {
+                name,
+                usb_id: String::new(),
+                serial: String::new(),
+                hash: String::new(),
+                via_port: String::new(),
+                classes: Vec::new(),
+            }),
+            permanent: false,
+            detail: "Thunderbolt".into(),
+        }
+    }
+
     /// An entry with no device, e.g. the service going down.
     pub fn system(kind: Kind, detail: impl Into<String>) -> Self {
         Self {
@@ -188,23 +208,40 @@ impl Entry {
 }
 
 /// Directory the journal lives in: `$XDG_DATA_HOME/cosmic-usb-guard`.
-pub fn data_dir() -> PathBuf {
-    let base = std::env::var_os("XDG_DATA_HOME")
+///
+/// `None` when neither `XDG_DATA_HOME` nor `HOME` gives an absolute path.
+/// There is deliberately no fallback to the temporary directory: a fixed path
+/// under `/tmp` is one any other local user can create first, as a file or a
+/// symlink, and then read or redirect the history. No journal is better.
+pub fn data_dir() -> Option<PathBuf> {
+    data_dir_from(std::env::var_os("XDG_DATA_HOME"), std::env::var_os("HOME"))
+}
+
+/// [`data_dir`] from explicit values, so it can be tested without changing
+/// the process environment.
+fn data_dir_from(
+    xdg_data_home: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    xdg_data_home
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
-        .unwrap_or_else(std::env::temp_dir);
-    base.join(PKG_NAME)
+        .or_else(|| {
+            home.map(PathBuf::from)
+                .filter(|p| p.is_absolute())
+                .map(|h| h.join(".local/share"))
+        })
+        .map(|base| base.join(PKG_NAME))
 }
 
-/// Full path to the journal file.
-pub fn path() -> PathBuf {
-    data_dir().join(JOURNAL_FILE)
+/// Full path to the journal file, when there is somewhere to keep it.
+pub fn path() -> Option<PathBuf> {
+    data_dir().map(|dir| dir.join(JOURNAL_FILE))
 }
 
-/// Path the journal is rotated to when it grows too large.
-fn rotated_path() -> PathBuf {
-    data_dir().join(format!("{JOURNAL_FILE}.1"))
+/// Path a journal file is rotated to when it grows too large.
+fn rotated_path(path: &Path) -> PathBuf {
+    path.with_file_name(format!("{JOURNAL_FILE}.1"))
 }
 
 /// Append an entry.
@@ -212,14 +249,29 @@ fn rotated_path() -> PathBuf {
 /// Failures are reported but never propagated to the caller: losing a log line
 /// must not stop the user from blocking a device.
 pub fn append(entry: &Entry) {
-    if let Err(e) = try_append(&path(), entry) {
+    let Some(path) = path() else {
+        crate::error_log!(
+            crate::debug::JOURNAL,
+            "no home directory to keep the journal in; entry not recorded"
+        );
+        return;
+    };
+    if let Err(e) = try_append(&path, entry) {
         crate::error_log!(crate::debug::JOURNAL, "could not write journal entry: {e}");
     }
 }
 
 fn try_append(path: &Path, entry: &Entry) -> std::io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+
+    // Owner-only: the history names every device plugged into this machine,
+    // with serial numbers, and when. Existing files and directories keep the
+    // permissions they have.
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)?;
     }
 
     rotate_if_needed(path)?;
@@ -230,6 +282,7 @@ fn try_append(path: &Path, entry: &Entry) -> std::io::Result<()> {
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
+        .mode(0o600)
         .open(path)?;
     file.write_all(line.as_bytes())?;
 
@@ -258,7 +311,7 @@ fn rotate_if_needed(path: &Path) -> std::io::Result<()> {
         "rotating journal at {} bytes",
         metadata.len()
     );
-    std::fs::rename(path, rotated_path())
+    std::fs::rename(path, rotated_path(path))
 }
 
 /// Read back the most recent entries, oldest first.
@@ -267,7 +320,9 @@ fn rotate_if_needed(path: &Path) -> std::io::Result<()> {
 /// a truncated final line from an interrupted write should not hide the rest
 /// of the history.
 pub fn read_recent() -> Vec<Entry> {
-    read_recent_from(&path(), JOURNAL_VIEW_LIMIT)
+    path()
+        .map(|path| read_recent_from(&path, JOURNAL_VIEW_LIMIT))
+        .unwrap_or_default()
 }
 
 fn read_recent_from(path: &Path, limit: usize) -> Vec<Entry> {
@@ -301,7 +356,10 @@ fn read_recent_from(path: &Path, limit: usize) -> Vec<Entry> {
 
 /// Delete the journal and its rotated generation.
 pub fn clear() -> std::io::Result<()> {
-    for path in [path(), rotated_path()] {
+    let Some(path) = path() else {
+        return Ok(());
+    };
+    for path in [rotated_path(&path), path] {
         match std::fs::remove_file(&path) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -454,9 +512,47 @@ mod tests {
 
     #[test]
     fn data_dir_is_under_the_users_data_home() {
-        // Must not fall back to a world-writable location when HOME is set.
-        let dir = data_dir();
-        assert!(dir.ends_with(PKG_NAME), "unexpected data dir: {dir:?}");
-        assert!(dir.is_absolute(), "data dir must be absolute: {dir:?}");
+        let dir = data_dir_from(None, Some("/home/someone".into())).unwrap();
+        assert_eq!(
+            dir,
+            PathBuf::from("/home/someone/.local/share").join(PKG_NAME)
+        );
+
+        let xdg = data_dir_from(Some("/data".into()), Some("/home/someone".into())).unwrap();
+        assert_eq!(xdg, PathBuf::from("/data").join(PKG_NAME));
+    }
+
+    #[test]
+    fn with_nowhere_to_keep_it_there_is_no_journal_rather_than_one_in_tmp() {
+        // A fixed path under /tmp can be created first by another user.
+        assert_eq!(data_dir_from(None, None), None);
+        // Relative values are not a home directory either.
+        assert_eq!(
+            data_dir_from(Some("data".into()), Some("home".into())),
+            None
+        );
+    }
+
+    #[test]
+    fn a_new_journal_is_readable_only_by_its_owner() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "cosmic-usb-guard-journal-mode-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("nested").join(JOURNAL_FILE);
+
+        try_append(&path, &Entry::system(Kind::ServiceUp, String::new())).unwrap();
+
+        let file_mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        let dir_mode = std::fs::metadata(path.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(file_mode, 0o600);
+        assert_eq!(dir_mode, 0o700);
     }
 }

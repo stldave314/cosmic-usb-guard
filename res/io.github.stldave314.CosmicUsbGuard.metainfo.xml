@@ -26,7 +26,7 @@
       <li>Lists every device USBGuard can see, with internal hubs filtered out by default</li>
       <li>Lists devices that are not plugged in but still have a standing rule, so a decision can be changed without them</li>
       <li>Revoke removes a device's standing rule and blocks it in one step</li>
-      <li>Optionally runs a program of your choosing when a specific trusted device is connected and authorised</li>
+      <li>Optionally runs a program of your choosing when a specific trusted device is connected and authorized</li>
       <li>Notifies when a standing rule refuses a device without asking, so it does not just silently fail to work</li>
       <li>Shows a status icon in the system tray and can start with your session</li>
       <li>Keeps a searchable history of every device event and decision</li>
@@ -70,6 +70,23 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="0.3.0" date="2026-10-16">
+      <description>
+        <p>Thunderbolt and USB4 support, binding a decision to a USB port, and fixes for every configuration problem the app reports.</p>
+        <ul>
+          <li>A Thunderbolt page showing the controller's security level and DMA protection, with Allow once, Always allow and Forget for each device</li>
+          <li>Thunderbolt health checks, with step-by-step instructions for settings that only firmware setup can change</li>
+          <li>Bind a remembered USB decision to the port the device is plugged into</li>
+          <li>Permission checks and fixes based on polkit, which is what actually governs the desktop's access to USBGuard</li>
+          <li>Security hardening: escaped notification text, owner-only history, decisions recorded only once they succeed</li>
+        </ul>
+      </description>
+    </release>
+    <release version="0.2.0" date="2026-09-03">
+      <description>
+        <p>A system-tray status icon replaces the panel applet, and per-device hook programs.</p>
+      </description>
+    </release>
     <release version="0.1.0" date="2026-08-29">
       <description>
         <p>First release.</p>

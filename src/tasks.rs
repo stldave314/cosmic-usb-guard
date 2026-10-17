@@ -11,6 +11,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::debug_log;
+use crate::thunderbolt;
 use crate::usbguard::{Client, Device, DeviceKey, Error, Health, PolicyRule, Target, health};
 
 /// The shared client, created on first use.
@@ -73,6 +74,9 @@ pub struct Refreshed {
     /// `None` means "not known", which the state treats as "ask anyway"
     /// rather than "no rules exist".
     pub rules: Option<Vec<PolicyRule>>,
+    /// Thunderbolt devices and domains, or `None` on a machine without
+    /// Thunderbolt or USB4.
+    pub thunderbolt: Option<thunderbolt::Snapshot>,
 }
 
 /// Why a refresh is happening.
@@ -124,43 +128,60 @@ pub async fn refresh(trigger: Trigger) -> Arc<Refreshed> {
     let connected = client().await.ok();
     let connection = connected.as_ref().map(|c| c.connection().clone());
 
-    // Health is systemd state plus a parameter read, and is safe to poll: the
-    // permission-sensitive parts of it latch through the same flags below.
-    let health = health::evaluate(connected.as_ref(), connection.as_ref()).await;
-
-    let devices = match connected.as_ref() {
-        _ if denied::is_set(&denied::DEVICES) => Err(crate::fl!("error-permission-denied")),
-        Some(client) => match client.list_devices().await {
-            Ok(devices) => Ok(devices),
-            Err(e) => {
-                if matches!(e, Error::PermissionDenied(_)) {
-                    denied::set(&denied::DEVICES);
+    // USBGuard and Thunderbolt are read at the same time, so a bolt that is
+    // slow to answer cannot hold up the USB results. Thunderbolt's checks join
+    // the same list, so the banner, the tray icon and the Status page weigh
+    // them like any other.
+    let usb = async {
+        let devices = match connected.as_ref() {
+            _ if denied::is_set(&denied::DEVICES) => Err(crate::fl!("error-permission-denied")),
+            Some(client) => match client.list_devices().await {
+                Ok(devices) => Ok(devices),
+                Err(e) => {
+                    if matches!(e, Error::PermissionDenied(_)) {
+                        denied::set(&denied::DEVICES);
+                    }
+                    Err(e.to_string())
                 }
-                Err(e.to_string())
-            }
-        },
-        None => Err(crate::fl!("error-service-unavailable")),
+            },
+            None => Err(crate::fl!("error-service-unavailable")),
+        };
+
+        let rules = match connected.as_ref() {
+            _ if denied::is_set(&denied::POLICY) => None,
+            Some(client) => match client.list_rules().await {
+                Ok(rules) => Some(rules),
+                Err(e) => {
+                    if matches!(e, Error::PermissionDenied(_)) {
+                        debug_log!(
+                            crate::debug::POLICY,
+                            "policy read refused; not retrying until the user asks"
+                        );
+                        denied::set(&denied::POLICY);
+                    }
+                    // `None` means "unknown", which makes the prompt logic ask
+                    // about a device rather than assume it is already covered.
+                    None
+                }
+            },
+            None => None,
+        };
+
+        // Health is systemd state, a parameter read and Polkit questions, all
+        // safe to poll; the policy it judges is the one just read, so it
+        // makes no call of its own past the latch.
+        let health =
+            health::evaluate(connected.as_ref(), connection.as_ref(), rules.as_deref()).await;
+        (devices, rules, health)
     };
 
-    let rules = match connected.as_ref() {
-        _ if denied::is_set(&denied::POLICY) => None,
-        Some(client) => match client.list_rules().await {
-            Ok(rules) => Some(rules),
-            Err(e) => {
-                if matches!(e, Error::PermissionDenied(_)) {
-                    debug_log!(
-                        crate::debug::POLICY,
-                        "policy read refused; not retrying until the user asks"
-                    );
-                    denied::set(&denied::POLICY);
-                }
-                // `None` means "unknown", which makes the prompt logic ask
-                // about a device rather than assume it is already covered.
-                None
-            }
-        },
-        None => None,
-    };
+    let ((devices, rules, mut health), bolt) = futures::join!(usb, read_thunderbolt());
+    if let Some((result, bolt_connection)) = &bolt {
+        health.checks.extend(
+            thunderbolt::health::evaluate(result, bolt_connection.as_ref().or(connection.as_ref()))
+                .await,
+        );
+    }
 
     if devices.is_err() {
         invalidate().await;
@@ -170,7 +191,109 @@ pub async fn refresh(trigger: Trigger) -> Arc<Refreshed> {
         devices,
         health,
         rules,
+        thunderbolt: bolt.map(|(result, _)| snapshot_or_error(result)),
     })
+}
+
+/// The shared bolt client, created on first use.
+fn bolt_cache() -> &'static Mutex<Option<thunderbolt::Client>> {
+    static CACHE: std::sync::OnceLock<Mutex<Option<thunderbolt::Client>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+
+/// Read bolt, with the connection it was read over.
+///
+/// `None` on a machine without Thunderbolt or USB4, so nothing is asked of a
+/// service that has nothing to manage. The connection is handed back for the
+/// Polkit check, which must ask about the same bus connection it describes.
+async fn read_thunderbolt() -> Option<(
+    Result<thunderbolt::Snapshot, Error>,
+    Option<zbus::Connection>,
+)> {
+    if !thunderbolt::sysfs::present() {
+        return None;
+    }
+
+    let client = {
+        let mut guard = bolt_cache().lock().await;
+        match guard.as_ref() {
+            Some(client) => client.clone(),
+            None => match thunderbolt::Client::connect().await {
+                Ok(client) => {
+                    *guard = Some(client.clone());
+                    client
+                }
+                Err(e) => return Some((Err(e), None)),
+            },
+        }
+    };
+
+    let result = client.snapshot().await;
+    if result.is_err() {
+        // bolt may have been restarted or removed; reconnect next time.
+        *bolt_cache().lock().await = None;
+    }
+    Some((result, Some(client.connection().clone())))
+}
+
+/// A snapshot to hand the UI, with a failure described rather than dropped.
+fn snapshot_or_error(result: Result<thunderbolt::Snapshot, Error>) -> thunderbolt::Snapshot {
+    result.unwrap_or_else(|e| thunderbolt::Snapshot {
+        error: Some(thunderbolt_error(&e)),
+        ..thunderbolt::Snapshot::default()
+    })
+}
+
+/// Re-read Thunderbolt alone, after bolt signalled a change.
+///
+/// `None` on a machine without Thunderbolt or USB4.
+pub async fn refresh_thunderbolt() -> Option<thunderbolt::Snapshot> {
+    read_thunderbolt()
+        .await
+        .map(|(result, _)| snapshot_or_error(result))
+}
+
+/// Something the user can do to a Thunderbolt device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThunderboltAction {
+    /// Authorize it for this connection.
+    Authorize,
+    /// Authorize it and have bolt remember it.
+    Enroll,
+    /// Have bolt forget it.
+    Forget,
+}
+
+/// Carry out a Thunderbolt action, returning the device UID with the result.
+pub async fn thunderbolt_action(
+    uid: String,
+    action: ThunderboltAction,
+) -> (String, Result<(), String>) {
+    let result = async {
+        let client = match bolt_cache().lock().await.clone() {
+            Some(client) => client,
+            None => thunderbolt::Client::connect().await?,
+        };
+        match action {
+            ThunderboltAction::Authorize => client.authorize(&uid).await,
+            ThunderboltAction::Enroll => client.enroll(&uid).await,
+            ThunderboltAction::Forget => client.forget(&uid).await,
+        }
+    }
+    .await
+    .map_err(|e| thunderbolt_error(&e));
+
+    (uid, result)
+}
+
+/// A Thunderbolt failure in words the user can act on.
+fn thunderbolt_error(error: &Error) -> String {
+    match error {
+        Error::PermissionDenied(_) => crate::fl!("error-thunderbolt-permission"),
+        Error::ServiceUnavailable(_) => crate::fl!("error-bolt-unavailable"),
+        other => crate::fl!("error-thunderbolt", message = other.to_string()),
+    }
 }
 
 /// Everything a decision needs that the async task cannot look up for itself.
@@ -185,19 +308,51 @@ pub struct Decision {
     pub daemon_id: Option<u32>,
     /// Descriptor hash. Empty when the device did not report one.
     pub hash: String,
-    /// The rule to write when the device is not plugged in and there is
-    /// nothing to authorise now.
+    /// The rule to write ourselves, when the daemon's own would not do.
+    ///
+    /// Two cases. Not plugged in: there is nothing to authorize, so a rule is
+    /// all the decision can be. Bound to a port: the rules the daemon writes
+    /// for a permanent decision never carry `via-port`. Otherwise `None`, and
+    /// the daemon writes the rule.
     pub rule: Option<String>,
+    /// The port the standing rule is bound to, or `None` for any port.
+    pub port: Option<String>,
 }
 
 impl Decision {
     /// Build a decision for `device` with the given target.
-    pub fn new(device: &Device, target: Target) -> Self {
+    ///
+    /// `bind` pins the rule to the port a plugged-in device is in now. A
+    /// device that is not plugged in keeps whatever binding its rule already
+    /// has, since there is no current port to bind it to.
+    pub fn new(device: &Device, target: Target, bind: bool) -> Self {
+        let (rule, port) = if device.is_connected() {
+            // The port counts only if a rule carrying it was built; a bind
+            // request whose rule could not be built falls back to an unbound
+            // decision, and must not then be compared as if it were bound.
+            let bound = if bind && device.can_bind_port() {
+                let port = device.via_port.clone();
+                device
+                    .rule_with_port(target, Some(&port))
+                    .map(|rule| (rule, port))
+            } else {
+                None
+            };
+            match bound {
+                Some((rule, port)) => (Some(rule), Some(port)),
+                None => (None, None),
+            }
+        } else {
+            let port = (!device.via_port.is_empty()).then(|| device.via_port.clone());
+            (device.retargeted_rule(target), port)
+        };
+
         Self {
             key: device.key(),
             daemon_id: device.daemon_id(),
             hash: device.hash.clone(),
-            rule: device.retargeted_rule(target),
+            rule,
+            port,
         }
     }
 }
@@ -226,10 +381,20 @@ pub async fn decide(
         daemon_id,
         hash,
         rule,
+        port,
     } = decision;
 
     let result = with_client(|client| async move {
-        if permanent && !hash.is_empty() {
+        // Nothing to replace when the policy already says this. Skipping the
+        // removal matters beyond tidiness: `removeRule` is the one call the
+        // stock polkit rules leave at `auth_admin`, so removing and re-adding
+        // an identical rule turns a no-op into a password prompt, and into a
+        // failure when that prompt is refused.
+        let recorded = permanent
+            && !hash.is_empty()
+            && already_recorded(&client.list_rules().await?, &hash, target, port.as_deref());
+
+        if permanent && !hash.is_empty() && !recorded {
             client
                 .remove_rules_for_hash(&hash)
                 .await
@@ -237,13 +402,27 @@ pub async fn decide(
         }
 
         match daemon_id {
-            // Plugged in: let the daemon apply the decision and, when it is
-            // permanent, generate the rule itself. Its generated rule carries
-            // the name, serial and interface list, which ours would not.
+            // Plugged in. Normally the daemon applies the decision and, when it
+            // is permanent, generates the rule itself: its rule carries the
+            // name, serial and interface list. A port-bound rule is the
+            // exception, because the daemon does not write `via-port` in its
+            // default configuration (`DeviceRulesWithPort=false`). That rule
+            // is appended here, after the old ones were removed above, and the
+            // decision is then applied without the daemon writing a second.
+            // Removal comes first because it is the step a refused password
+            // stops, and stopping there leaves everything as it was.
             Some(id) => {
-                client.apply_policy(id, target, permanent).await?;
+                let write_own = permanent && !recorded && rule.is_some();
+                if write_own && let Some(rule) = rule.as_deref() {
+                    client.append_rule(rule, false).await?;
+                }
+                let daemon_writes = permanent && !recorded && rule.is_none();
+                client.apply_policy(id, target, daemon_writes).await?;
             }
-            // Not plugged in: there is no device to authorise, so the decision
+            // Not plugged in and already recorded: the rule is the whole
+            // decision, and it is there.
+            None if recorded => {}
+            // Not plugged in: there is no device to authorize, so the decision
             // can only be recorded for next time.
             None => {
                 let rule = rule.ok_or_else(|| {
@@ -262,10 +441,62 @@ pub async fn decide(
     (key, result)
 }
 
+/// Whether the rules pinned to `hash` already say `target` on `port`, and
+/// nothing else.
+///
+/// "Nothing else" because the daemon takes the first match: an `allow` behind
+/// a `reject` for the same hash is not an allow, and still has to be replaced.
+/// The port is compared too, so binding or unbinding a decision that otherwise
+/// stands is never mistaken for a no-op.
+fn already_recorded(rules: &[PolicyRule], hash: &str, target: Target, port: Option<&str>) -> bool {
+    let mut pinned = rules
+        .iter()
+        .filter(|rule| rule.hash() == Some(hash))
+        .peekable();
+    pinned.peek().is_some() && pinned.all(|rule| rule.rule.target == target && rule.port() == port)
+}
+
+/// Replace a device's standing rules with `rule`, and optionally apply a
+/// decision to the device as it stands.
+///
+/// Used to bind a standing decision to a port or release it. The old rules are
+/// removed first, the same order as [`decide`]: removal is the step a refused
+/// password stops, and stopping there leaves the policy exactly as it was.
+/// The reverse order would leave the new rule appended *behind* the old one,
+/// which the daemon reaches second and so never applies.
+///
+/// `apply` carries a plugged-in device's ID and the rule's target when the
+/// rewritten rule covers a device the old one did not — a device blocked
+/// because it was on another port. The daemon does not re-evaluate a device
+/// already present when its rule changes, so without this the device would
+/// stay blocked under a rule that says otherwise.
+pub async fn replace_rule(
+    key: DeviceKey,
+    hash: String,
+    rule: String,
+    apply: Option<(u32, Target)>,
+) -> (DeviceKey, Result<(), String>) {
+    let result = with_client(|client| async move {
+        client
+            .remove_rules_for_hash(&hash)
+            .await
+            .map_err(irreversible)?;
+        client.append_rule(&rule, false).await?;
+        if let Some((id, target)) = apply {
+            client.apply_policy(id, target, false).await?;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string());
+
+    (key, result)
+}
+
 /// Revoke a device: remove its standing rules, then block it now.
 ///
-/// Both halves matter. Removing the rule alone leaves the device authorised
-/// until it is unplugged; blocking alone leaves a rule that re-authorises it
+/// Both halves matter. Removing the rule alone leaves the device authorized
+/// until it is unplugged; blocking alone leaves a rule that re-authorizes it
 /// on the next replug. The rule is removed first so that, if the block fails,
 /// the device is not left with a stale allow rule.
 pub async fn revoke(
@@ -337,7 +568,7 @@ mod tests {
     /// authentication dialog every twenty seconds, so both directions are
     /// checked rather than assumed.
     ///
-    /// Serialised into one test because the flags are process-global statics;
+    /// Serialized into one test because the flags are process-global statics;
     /// separate `#[test]` functions would race under the default harness.
     #[test]
     fn a_refusal_latches_until_the_user_asks_again() {
@@ -359,6 +590,107 @@ mod tests {
         denied::clear_all();
         assert!(!denied::is_set(&denied::DEVICES));
         assert!(!denied::is_set(&denied::POLICY));
+    }
+
+    fn rules(texts: &[&str]) -> Vec<PolicyRule> {
+        texts
+            .iter()
+            .enumerate()
+            .map(|(i, text)| PolicyRule::from_pair(i as u32, text).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn a_decision_the_policy_already_records_needs_no_rule_removed() {
+        let policy = rules(&[
+            r#"allow id 0781:55a9 hash "stick""#,
+            r#"block id 1234:5678 hash "other""#,
+        ]);
+
+        // The case that failed: Allow on a device that is already always
+        // allowed went through `removeRule` and was refused.
+        assert!(already_recorded(&policy, "stick", Target::Allow, None));
+
+        // A different answer, or no rule at all, still has work to do.
+        assert!(!already_recorded(&policy, "stick", Target::Block, None));
+        assert!(!already_recorded(&policy, "other", Target::Allow, None));
+        assert!(!already_recorded(&policy, "absent", Target::Allow, None));
+    }
+
+    #[test]
+    fn a_matching_rule_behind_a_contradicting_one_is_not_already_recorded() {
+        // First match wins in the daemon, so the allow here is unreachable and
+        // the pair has to be replaced rather than left alone.
+        let policy = rules(&[
+            r#"reject id 0781:55a9 hash "stick""#,
+            r#"allow id 0781:55a9 hash "stick""#,
+        ]);
+        assert!(!already_recorded(&policy, "stick", Target::Allow, None));
+    }
+
+    #[test]
+    fn binding_or_unbinding_is_never_skipped_as_already_recorded() {
+        let unbound = rules(&[r#"allow id 0781:55a9 hash "stick""#]);
+        let bound = rules(&[r#"allow id 0781:55a9 hash "stick" via-port "3-5""#]);
+
+        assert!(!already_recorded(
+            &unbound,
+            "stick",
+            Target::Allow,
+            Some("3-5")
+        ));
+        assert!(!already_recorded(&bound, "stick", Target::Allow, None));
+        assert!(!already_recorded(
+            &bound,
+            "stick",
+            Target::Allow,
+            Some("1-2")
+        ));
+        assert!(already_recorded(
+            &bound,
+            "stick",
+            Target::Allow,
+            Some("3-5")
+        ));
+    }
+
+    fn device(rule: &str, connected: bool) -> Device {
+        if connected {
+            Device::from_rule(7, rule).unwrap()
+        } else {
+            Device::remembered(rule).unwrap()
+        }
+    }
+
+    #[test]
+    fn a_bound_decision_writes_its_own_rule_with_the_current_port() {
+        let stick = device(
+            r#"block id 0781:55a9 hash "stick" parent-hash "hub" via-port "3-5""#,
+            true,
+        );
+
+        let bound = Decision::new(&stick, Target::Allow, true);
+        assert_eq!(bound.port.as_deref(), Some("3-5"));
+        assert_eq!(
+            bound.rule.as_deref(),
+            Some(r#"allow id 0781:55a9 hash "stick" parent-hash "hub" via-port "3-5""#)
+        );
+
+        // Unbound, the daemon writes the rule, and it never carries a port.
+        let unbound = Decision::new(&stick, Target::Allow, false);
+        assert_eq!(unbound.rule, None);
+        assert_eq!(unbound.port, None);
+    }
+
+    #[test]
+    fn an_unplugged_device_keeps_the_binding_its_rule_already_has() {
+        let bound = device(r#"block id 0781:55a9 hash "stick" via-port "3-5""#, false);
+        let decision = Decision::new(&bound, Target::Allow, false);
+        assert_eq!(decision.port.as_deref(), Some("3-5"));
+        assert_eq!(
+            decision.rule.as_deref(),
+            Some(r#"allow id 0781:55a9 hash "stick" via-port "3-5""#)
+        );
     }
 
     #[test]

@@ -1,10 +1,10 @@
 [package]
 name = "cosmic-usb-guard"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.93"
 license = "GPL-3.0-or-later"
-description = "COSMIC desktop front-end for USBGuard, with a tray indicator"
+description = "COSMIC desktop front-end for USBGuard and Thunderbolt, with a tray indicator"
 repository = "https://github.com/stldave314/cosmic-usb-guard"
 homepage = "https://github.com/stldave314/cosmic-usb-guard"
 readme = "README.md"
@@ -29,6 +29,10 @@ release-build = []
 anyhow = "1.0"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
 futures = "0.3"
+# `O_NOFOLLOW` and `getuid` for the developer debug log; its value differs
+# between architectures, so it is not spelled out by hand. Already in the
+# dependency tree through other crates.
+libc = "0.2"
 # StatusNotifierItem tray icon. Defaults to the tokio + zbus stack this crate
 # already carries, so it adds no second runtime.
 ksni = "0.3"
@@ -74,14 +78,18 @@ maintainer = "stldave314 <stldave314@users.noreply.github.com>"
 copyright = "2026, the cosmic-usb-guard contributors"
 license-file = ["LICENSE", "0"]
 extended-description = """
-A COSMIC desktop front-end for USBGuard. Shows a tray indicator, prompts when a
-new USB device is connected, can run a per-device hook script once a device is
-authorised, records every decision, and checks that USBGuard is actually
-protecting the system rather than merely installed."""
+A COSMIC desktop front-end for USBGuard, and for Thunderbolt and USB4 through
+bolt. Shows a tray indicator, prompts when a new USB or Thunderbolt device is
+connected, can bind a decision to the USB port, can run a per-device hook
+script once a device is authorized, records every decision, and checks that
+the system is actually protected rather than merely set up, with a fix for
+each problem it finds."""
 section = "utils"
 priority = "optional"
 depends = "$auto, usbguard (>= 1.1.0)"
-recommends = "adwaita-icon-theme"
+# bolt authorizes Thunderbolt and USB4 devices; only machines with such a
+# controller need it, so it is recommended rather than required.
+recommends = "adwaita-icon-theme, bolt"
 assets = [
     ["target/release/cosmic-usb-guard", "usr/bin/", "755"],
     ["res/io.github.stldave314.CosmicUsbGuard.desktop", "usr/share/applications/", "644"],
@@ -92,9 +100,10 @@ assets = [
 ]
 
 [package.metadata.generate-rpm]
-summary = "COSMIC desktop front-end and panel indicator for USBGuard"
+summary = "COSMIC desktop front-end and tray indicator for USBGuard and Thunderbolt"
 license = "GPL-3.0-or-later"
 requires = { usbguard = ">= 1.1.0" }
+recommends = { bolt = "*" }
 assets = [
     { source = "target/release/cosmic-usb-guard", dest = "/usr/bin/cosmic-usb-guard", mode = "755" },
     { source = "res/io.github.stldave314.CosmicUsbGuard.desktop", dest = "/usr/share/applications/io.github.stldave314.CosmicUsbGuard.desktop", mode = "644" },

@@ -80,6 +80,13 @@ impl HookDraft {
 pub struct Pending {
     /// Daemon-assigned device ID.
     pub device_id: u32,
+    /// Descriptor hash of the device the prompt was raised for.
+    ///
+    /// The daemon reuses IDs. A notification can outlive its device — the
+    /// prompt says "Allow" for one thing, the user clicks it minutes later,
+    /// and by then the ID may belong to something else. A click only acts if
+    /// the device holding the ID still has this hash.
+    pub hash: String,
     /// Whether the device arrived while we were watching, as opposed to
     /// already being connected when we started.
     ///
@@ -87,6 +94,15 @@ pub struct Pending {
     /// re-announcing everything that was already blocked at login would train
     /// the user to dismiss prompts without reading them.
     pub live: bool,
+    /// ID of the notification raised for it, if any.
+    pub notification_id: Option<u32>,
+}
+
+/// A Thunderbolt device waiting for the user to allow it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThunderboltPending {
+    /// bolt's UID for the device.
+    pub uid: String,
     /// ID of the notification raised for it, if any.
     pub notification_id: Option<u32>,
 }
@@ -106,6 +122,10 @@ pub enum Effect {
     RunHook(u32),
     /// Re-read the journal from disk.
     ReloadHistory,
+    /// Post a notification asking about this Thunderbolt device.
+    NotifyThunderbolt(String),
+    /// Show the window at the Thunderbolt page, because a device is waiting.
+    ShowThunderbolt,
 }
 
 /// Everything the UI renders from.
@@ -134,10 +154,23 @@ pub struct State {
     pub health_checked: bool,
     /// Devices awaiting a decision.
     pub pending: Vec<Pending>,
+    /// Prompts the user dismissed, by daemon ID and descriptor hash, until the
+    /// device is unplugged or plugged in again.
+    ///
+    /// Without this a dismissal lasted only until the next refresh, which
+    /// found the device still blocked and asked again.
+    dismissed: HashSet<(u32, String)>,
     /// Device whose details are expanded.
     pub selected: Option<DeviceKey>,
     /// Whether the next decision is written as a standing rule.
     pub permanent: bool,
+    /// The device whose prompt has "bind to this port" switched on.
+    ///
+    /// Held per device rather than as a flag, and never persisted: binding is
+    /// a deliberate choice about one device. A plain flag stayed on after
+    /// that device was decided, and the next device's prompt arrived with the
+    /// switch already set.
+    pub bind: Option<u32>,
     /// Devices with an in-flight request, so their buttons can be disabled.
     pub busy: HashSet<DeviceKey>,
     /// The last error worth showing the user.
@@ -160,8 +193,41 @@ pub struct State {
     /// means noticing that the standing rule contradicts what the user is now
     /// asking for.
     standing: HashMap<String, Target>,
+    /// The first rule the policy pins to each device hash.
+    ///
+    /// The rule the daemon acts on, kept whole so its port binding can be
+    /// read and so it can be rewritten with a different one.
+    standing_rules: HashMap<String, PolicyRule>,
+    /// The whole policy, in the order the daemon evaluates it.
+    policy: Vec<PolicyRule>,
     /// Whether `standing` reflects a successful policy read.
     standing_loaded: bool,
+    /// Thunderbolt devices and domains, once read. `None` before the first
+    /// read and on machines without Thunderbolt or USB4.
+    pub thunderbolt: Option<crate::thunderbolt::Snapshot>,
+    /// Thunderbolt devices waiting to be allowed.
+    pub thunderbolt_pending: Vec<ThunderboltPending>,
+    /// Thunderbolt devices with a request in flight, by UID.
+    pub thunderbolt_busy: HashSet<String>,
+    /// Thunderbolt devices the user dismissed, until they stop waiting.
+    ///
+    /// Without this a dismissal lasted only until the next refresh, which
+    /// found the device still waiting and asked again.
+    thunderbolt_dismissed: HashSet<String>,
+    /// UIDs that were waiting at the last *successful* bolt read, or `None`
+    /// before the first one.
+    ///
+    /// The baseline for what counts as newly arrived. A failed read does not
+    /// replace it: if it did, the first good read after a hiccup would
+    /// announce every device that had been waiting all along.
+    thunderbolt_baseline: Option<HashSet<String>>,
+    /// Whether journal entries are written to disk as well as kept here.
+    ///
+    /// Off only in tests. A test that exercises journaling must never append
+    /// to the real file: every `cargo test` run would otherwise leave a
+    /// fabricated event — "the daemon failed" — in the user's history, where
+    /// it is indistinguishable from a real one.
+    persist_journal: bool,
 }
 
 impl Default for State {
@@ -169,6 +235,7 @@ impl Default for State {
         let config = ConfigState::load();
         Self {
             permanent: config.settings.default_permanent,
+            bind: None,
             config,
             connected: false,
             disconnect_reason: String::new(),
@@ -177,6 +244,7 @@ impl Default for State {
             health: Health::default(),
             health_checked: false,
             pending: Vec::new(),
+            dismissed: HashSet::new(),
             selected: None,
             busy: HashSet::new(),
             error: None,
@@ -185,7 +253,15 @@ impl Default for State {
             hook_draft: None,
             hooks_fired: HashSet::new(),
             standing: HashMap::new(),
+            standing_rules: HashMap::new(),
+            policy: Vec::new(),
             standing_loaded: false,
+            thunderbolt: None,
+            thunderbolt_pending: Vec::new(),
+            thunderbolt_busy: HashSet::new(),
+            thunderbolt_dismissed: HashSet::new(),
+            thunderbolt_baseline: None,
+            persist_journal: true,
         }
     }
 }
@@ -213,6 +289,19 @@ impl State {
                 .find(|d| &d.hash == hash)
                 .filter(|_| !self.is_connected_hash(hash)),
         }
+    }
+
+    /// How the interface refers to the device with this hash: the plugged-in
+    /// one if there is one, otherwise the remembered one.
+    pub fn key_for_hash(&self, hash: &str) -> Option<DeviceKey> {
+        if hash.is_empty() {
+            return None;
+        }
+        self.devices
+            .iter()
+            .chain(self.policy_devices.iter())
+            .find(|d| d.hash == hash)
+            .map(Device::key)
     }
 
     /// Whether the user has marked this device as part of the machine.
@@ -355,7 +444,78 @@ impl State {
         self.standing_target(device).is_some()
     }
 
-    /// Whether the standing rule contradicts the device's live authorisation.
+    /// A rule earlier in the policy that could decide about this device before
+    /// its own rule is reached.
+    ///
+    /// The daemon applies the first rule that matches, and the rules this app
+    /// writes go at the end. An older, broader rule — `allow id 0781:5567`, or
+    /// `block with-interface 08:*:*` — ahead of them can therefore overrule a
+    /// decision that reported success. Only devices with a standing rule are
+    /// considered: for the rest, whatever matches first *is* their rule.
+    pub fn overriding_rule(&self, device: &Device) -> Option<&PolicyRule> {
+        if !self.standing_loaded || device.hash.is_empty() {
+            return None;
+        }
+        let own = self
+            .policy
+            .iter()
+            .position(|rule| rule.hash() == Some(device.hash.as_str()))?;
+        self.policy[..own]
+            .iter()
+            .find(|rule| rule.may_match(device))
+    }
+
+    /// The port this device's standing rule is bound to, if it is bound.
+    pub fn standing_port(&self, device: &Device) -> Option<&str> {
+        if !self.standing_loaded || device.hash.is_empty() {
+            return None;
+        }
+        self.standing_rules.get(&device.hash)?.port()
+    }
+
+    /// Where a plugged-in device's rule is bound, when it is somewhere else.
+    ///
+    /// Returns `(bound, now)`. The rule does not match on any other port, so
+    /// the daemon has fallen back to blocking the device: from the user's
+    /// side a device they allowed for good has stopped working, and this is
+    /// the reason.
+    pub fn port_mismatch(&self, device: &Device) -> Option<(String, String)> {
+        let bound = self.standing_port(device)?;
+        (device.is_connected() && bound != device.via_port)
+            .then(|| (bound.to_string(), device.via_port.clone()))
+    }
+
+    /// Whether the standing rule actually covers this device where it is.
+    ///
+    /// A rule bound to another port is a standing rule that does not apply,
+    /// and treating it as one would leave the device blocked with nobody
+    /// asked about it.
+    pub fn standing_rule_applies(&self, device: &Device) -> bool {
+        self.has_standing_rule(device) && self.port_mismatch(device).is_none()
+    }
+
+    /// The standing rule rewritten bound to the device's current port, or
+    /// released from any port.
+    ///
+    /// `None` when there is no standing rule, or when binding is asked for a
+    /// device that is not plugged in — it has no current port to bind to.
+    pub fn rebound_rule(&self, device: &Device, bind: bool) -> Option<String> {
+        if !self.standing_loaded || device.hash.is_empty() {
+            return None;
+        }
+        let rule = self.standing_rules.get(&device.hash)?;
+        let port = if bind {
+            if !device.can_bind_port() {
+                return None;
+            }
+            Some(device.via_port.as_str())
+        } else {
+            None
+        };
+        crate::usbguard::rule::with_via_port(&rule.rule.raw, port)
+    }
+
+    /// Whether the standing rule contradicts the device's live authorization.
     ///
     /// This is the state a one-off decision leaves behind: the device is
     /// allowed (or blocked) now, and the rule will undo that on the next
@@ -411,11 +571,11 @@ impl State {
 
         // Everything blocked and pluggable wants a decision, but nothing here
         // arrived while we were watching, so none of it is `live`.
-        let existing: Vec<u32> = self
+        let existing: Vec<(u32, String)> = self
             .devices
             .iter()
             .filter(|device| self.needs_decision(device))
-            .filter_map(Device::daemon_id)
+            .filter_map(|device| Some((device.daemon_id()?, device.hash.clone())))
             .collect();
 
         let mut effects = Vec::new();
@@ -426,13 +586,22 @@ impl State {
         effects.extend(self.retain_pending(|state, pending| {
             state
                 .device(pending.device_id)
-                .is_some_and(|device| state.needs_decision(device))
+                .is_some_and(|device| device.hash == pending.hash && state.needs_decision(device))
         }));
 
-        for id in existing {
-            if !self.is_pending(id) {
+        // Forget dismissals for devices that have gone.
+        let present: HashSet<(u32, String)> = self
+            .devices
+            .iter()
+            .filter_map(|d| Some((d.daemon_id()?, d.hash.clone())))
+            .collect();
+        self.dismissed.retain(|key| present.contains(key));
+
+        for (id, hash) in existing {
+            if !self.is_pending(id) && !self.dismissed.contains(&(id, hash.clone())) {
                 self.pending.push(Pending {
                     device_id: id,
+                    hash,
                     live: false,
                     notification_id: None,
                 });
@@ -456,7 +625,7 @@ impl State {
         self.disconnect_reason = reason;
 
         // The device list is no longer current. Keeping it on screen would
-        // present stale authorisations as live ones.
+        // present stale authorizations as live ones.
         self.devices.clear();
         self.policy_devices.clear();
         self.standing_loaded = false;
@@ -480,6 +649,10 @@ impl State {
                 self.busy.remove(&key);
                 // So the hook runs again the next time it is plugged in.
                 self.hooks_fired.remove(&device.hash);
+                // And so it is asked about again.
+                if let Some(id) = device.daemon_id() {
+                    self.dismissed.remove(&(id, device.hash.clone()));
+                }
                 effects.extend(self.retain_pending(|_, p| Some(p.device_id) != device.daemon_id()));
                 self.record(Entry::device(Kind::Removed, Actor::Policy, &device));
                 return effects;
@@ -499,7 +672,7 @@ impl State {
         };
         self.record(Entry::device(kind, Actor::Policy, &device));
 
-        // A hook belongs to a device that is already authorised, so an insert
+        // A hook belongs to a device that is already authorized, so an insert
         // that arrives allowed — because a standing rule allowed it — is the
         // moment to run it.
         effects.extend(self.hook_effect(&device));
@@ -528,6 +701,7 @@ impl State {
             if !self.is_pending(id) {
                 self.pending.push(Pending {
                     device_id: id,
+                    hash: device.hash.clone(),
                     live: true,
                     notification_id: None,
                 });
@@ -578,7 +752,7 @@ impl State {
             && !device.is_root_hub()
             && let Some(id) = device.daemon_id()
         {
-            // Something de-authorised a device that was working. The user did
+            // Something de-authorized a device that was working. The user did
             // not do it here, or this would have been journalled as their own.
             effects.push(Effect::NotifyAutoBlocked(id));
         }
@@ -587,7 +761,7 @@ impl State {
 
     /// Whether `device` should run its hook now, marking it as run if so.
     ///
-    /// The authorisation requirement is enforced again in [`crate::hooks::run`];
+    /// The authorization requirement is enforced again in [`crate::hooks::run`];
     /// this only decides *when* to ask, and stops one plug from running the
     /// hook twice because both an insert and a policy signal described it.
     fn hook_effect(&mut self, device: &Device) -> Option<Effect> {
@@ -649,12 +823,39 @@ impl State {
         );
     }
 
+    /// Record a Thunderbolt action this app made.
+    pub fn record_thunderbolt(
+        &mut self,
+        device: &crate::thunderbolt::Device,
+        action: crate::tasks::ThunderboltAction,
+    ) {
+        use crate::tasks::ThunderboltAction;
+        let (kind, permanent) = match action {
+            ThunderboltAction::Authorize => (Kind::Allowed, false),
+            ThunderboltAction::Enroll => (Kind::Allowed, true),
+            ThunderboltAction::Forget => (Kind::Revoked, false),
+        };
+        self.record(
+            Entry::thunderbolt(kind, Actor::User, device.display_name()).permanent(permanent),
+        );
+    }
+
     /// Record a revocation this app made.
     pub fn record_revocation(&mut self, device: &Device, rules_removed: usize) {
         self.record(
             Entry::device(Kind::Revoked, Actor::User, device)
                 .with_detail(format!("{rules_removed} rule(s) removed")),
         );
+    }
+
+    /// Stop asking about a device until it is unplugged or plugged in again,
+    /// returning any notification to withdraw. The device stays as USBGuard
+    /// left it: blocked.
+    pub fn dismiss_pending(&mut self, device_id: u32) -> Vec<Effect> {
+        if let Some(device) = self.device(device_id) {
+            self.dismissed.insert((device_id, device.hash.clone()));
+        }
+        self.resolve_pending(device_id)
     }
 
     /// Clear a device's prompt, returning any notification to withdraw.
@@ -664,18 +865,31 @@ impl State {
 
     /// Attach a posted notification's ID to its prompt so it can be withdrawn
     /// once the decision is made.
-    pub fn set_notification(&mut self, device_id: u32, notification_id: u32) {
-        if let Some(pending) = self.pending.iter_mut().find(|p| p.device_id == device_id) {
-            pending.notification_id = Some(notification_id);
+    ///
+    /// Returns `false` when the prompt has already gone, so the caller can
+    /// withdraw the notification instead of leaving it unanswerable.
+    pub fn set_notification(&mut self, device_id: u32, notification_id: u32) -> bool {
+        match self.pending.iter_mut().find(|p| p.device_id == device_id) {
+            Some(pending) => {
+                pending.notification_id = Some(notification_id);
+                true
+            }
+            None => false,
         }
     }
 
     /// The device a notification belongs to.
+    ///
+    /// `None` when the device holding that ID is no longer the one the
+    /// notification described — see [`Pending::hash`].
     pub fn device_for_notification(&self, notification_id: u32) -> Option<u32> {
-        self.pending
+        let pending = self
+            .pending
             .iter()
-            .find(|p| p.notification_id == Some(notification_id))
-            .map(|p| p.device_id)
+            .find(|p| p.notification_id == Some(notification_id))?;
+        self.device(pending.device_id)
+            .is_some_and(|device| device.hash == pending.hash)
+            .then_some(pending.device_id)
     }
 
     /// Replace the health report.
@@ -698,9 +912,143 @@ impl State {
         self.health_checked = true;
     }
 
+    /// Replace the Thunderbolt picture, returning what the binary must do.
+    ///
+    /// A device counts as newly arrived only if it was not already waiting in
+    /// the previous snapshot, and nothing counts as arrived on the first read:
+    /// the same rule as for USB, so a dock left plugged in overnight is not
+    /// announced as new at every login.
+    pub fn set_thunderbolt(&mut self, snapshot: crate::thunderbolt::Snapshot) -> Vec<Effect> {
+        // A failed read says nothing about the devices. Show the error, and
+        // leave the prompts and the arrival baseline exactly as they were.
+        if snapshot.error.is_some() {
+            self.thunderbolt = Some(snapshot);
+            return Vec::new();
+        }
+
+        // Only devices the controller would actually authorize one by one. At
+        // a level that never tunnels PCIe there is nothing to allow, and an
+        // Allow button would only fail.
+        let waiting: Vec<String> = snapshot
+            .devices
+            .iter()
+            .filter(|d| d.is_waiting() && snapshot.asks_about(d))
+            .map(|d| d.uid.clone())
+            .collect();
+        self.thunderbolt = Some(snapshot);
+
+        let first = self.thunderbolt_baseline.is_none();
+        let previously_waiting = self
+            .thunderbolt_baseline
+            .replace(waiting.iter().cloned().collect())
+            .unwrap_or_default();
+
+        // A dismissal lasts until the device stops waiting: plugged in again,
+        // it is asked about again.
+        self.thunderbolt_dismissed
+            .retain(|uid| waiting.contains(uid));
+
+        // Withdraw prompts for devices that are no longer waiting: allowed
+        // elsewhere, or unplugged.
+        let (kept, dropped): (Vec<_>, Vec<_>) = std::mem::take(&mut self.thunderbolt_pending)
+            .into_iter()
+            .partition(|p| waiting.contains(&p.uid));
+        self.thunderbolt_pending = kept;
+        let mut effects: Vec<Effect> = dropped
+            .into_iter()
+            .filter_map(|p| p.notification_id.map(Effect::CloseNotification))
+            .collect();
+
+        for uid in waiting {
+            if self.thunderbolt_dismissed.contains(&uid)
+                || self.thunderbolt_pending.iter().any(|p| p.uid == uid)
+            {
+                continue;
+            }
+            self.thunderbolt_pending.push(ThunderboltPending {
+                uid: uid.clone(),
+                notification_id: None,
+            });
+
+            let arrived = !first && !previously_waiting.contains(&uid);
+            if arrived && self.config.settings.prompt_on_insert {
+                debug_log!(crate::debug::THUNDERBOLT, "{uid} is waiting to be allowed");
+                if self.config.settings.notify_on_insert {
+                    effects.push(Effect::NotifyThunderbolt(uid));
+                }
+                if self.config.settings.auto_open_popup {
+                    effects.push(Effect::ShowThunderbolt);
+                }
+            }
+        }
+
+        effects
+    }
+
+    /// Thunderbolt devices waiting to be allowed, in arrival order.
+    pub fn thunderbolt_waiting(&self) -> Vec<&crate::thunderbolt::Device> {
+        let Some(snapshot) = self.thunderbolt.as_ref() else {
+            return Vec::new();
+        };
+        self.thunderbolt_pending
+            .iter()
+            .filter_map(|p| snapshot.device(&p.uid))
+            .collect()
+    }
+
+    /// Stop prompting about a Thunderbolt device until it stops waiting,
+    /// returning any notification to withdraw. The device stays exactly as it
+    /// was: not authorized.
+    pub fn dismiss_thunderbolt(&mut self, uid: &str) -> Vec<Effect> {
+        self.thunderbolt_dismissed.insert(uid.to_string());
+        self.resolve_thunderbolt(uid)
+    }
+
+    /// Clear a Thunderbolt prompt, returning any notification to withdraw.
+    pub fn resolve_thunderbolt(&mut self, uid: &str) -> Vec<Effect> {
+        let (kept, dropped): (Vec<_>, Vec<_>) = std::mem::take(&mut self.thunderbolt_pending)
+            .into_iter()
+            .partition(|p| p.uid != uid);
+        self.thunderbolt_pending = kept;
+        dropped
+            .into_iter()
+            .filter_map(|p| p.notification_id.map(Effect::CloseNotification))
+            .collect()
+    }
+
+    /// Attach a posted notification to a Thunderbolt prompt.
+    ///
+    /// Returns `false` when the prompt has already gone — the device was
+    /// allowed or unplugged while the notification was being posted — so the
+    /// caller can withdraw it rather than leave a prompt nobody can answer.
+    pub fn set_thunderbolt_notification(&mut self, uid: &str, notification_id: u32) -> bool {
+        match self.thunderbolt_pending.iter_mut().find(|p| p.uid == uid) {
+            Some(pending) => {
+                pending.notification_id = Some(notification_id);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The Thunderbolt device a notification belongs to.
+    pub fn thunderbolt_for_notification(&self, notification_id: u32) -> Option<String> {
+        self.thunderbolt_pending
+            .iter()
+            .find(|p| p.notification_id == Some(notification_id))
+            .map(|p| p.uid.clone())
+    }
+
+    /// Everything waiting for a decision, USB and Thunderbolt together.
+    pub fn pending_count(&self) -> usize {
+        self.pending.len() + self.thunderbolt_pending.len()
+    }
+
     /// Replace everything derived from the daemon's rule set.
     pub fn set_policy(&mut self, rules: &[PolicyRule]) {
         self.standing = standing_targets(rules);
+        self.standing_rules = first_rule_per_hash(rules);
+        self.policy = rules.to_vec();
         self.standing_loaded = true;
         self.policy_devices = remembered_devices(rules);
         debug_log!(
@@ -713,7 +1061,7 @@ impl State {
 
     /// Mark a device as part of this machine, or unmark it.
     ///
-    /// Marking is a display and prompting preference, never an authorisation:
+    /// Marking is a display and prompting preference, never an authorization:
     /// an internal device stays exactly as USBGuard has it until the user
     /// allows it explicitly. What it does change is that the app stops asking
     /// about it on every boot, which is the whole reason for the mark.
@@ -779,7 +1127,7 @@ impl State {
             && !device.is_root_hub()
             && !device.is_hardwired()
             && !self.is_internal(device)
-            && !self.has_standing_rule(device)
+            && !self.standing_rule_applies(device)
     }
 
     fn upsert(&mut self, device: Device) {
@@ -807,7 +1155,9 @@ impl State {
         if !self.config.settings.journal_enabled {
             return;
         }
-        journal::append(&entry);
+        if self.persist_journal {
+            journal::append(&entry);
+        }
         self.history.push(entry);
     }
 }
@@ -839,6 +1189,20 @@ pub fn standing_targets(rules: &[PolicyRule]) -> HashMap<String, Target> {
         }
     }
     targets
+}
+
+/// The first rule pinned to each device hash, which is the one the daemon
+/// applies — see [`standing_targets`].
+pub fn first_rule_per_hash(rules: &[PolicyRule]) -> HashMap<String, PolicyRule> {
+    let mut first = HashMap::new();
+    for rule in rules {
+        if let Some(hash) = rule.hash() {
+            first
+                .entry(hash.to_string())
+                .or_insert_with(|| rule.clone());
+        }
+    }
+    first
 }
 
 /// The devices a policy listing pins rules to, one entry per device.
@@ -890,8 +1254,10 @@ mod tests {
             health: Health::default(),
             health_checked: false,
             pending: Vec::new(),
+            dismissed: HashSet::new(),
             selected: None,
             permanent: false,
+            bind: None,
             busy: HashSet::new(),
             error: None,
             history: Vec::new(),
@@ -899,7 +1265,15 @@ mod tests {
             hook_draft: None,
             hooks_fired: HashSet::new(),
             standing: HashMap::new(),
+            standing_rules: HashMap::new(),
+            policy: Vec::new(),
             standing_loaded: false,
+            thunderbolt: None,
+            thunderbolt_pending: Vec::new(),
+            thunderbolt_busy: HashSet::new(),
+            thunderbolt_dismissed: HashSet::new(),
+            thunderbolt_baseline: None,
+            persist_journal: false,
         };
         // Keep tests off the real journal file.
         state.config.settings.journal_enabled = false;
@@ -953,7 +1327,7 @@ mod tests {
         let mut state = state();
         let root_hub = Device::from_rule(
             1,
-            r#"block id 1d6b:0002 hash "R=" with-connect-type "hardwired""#,
+            r#"block id 1d6b:0002 hash "R=" via-port "usb1" with-connect-type "hardwired""#,
         )
         .unwrap();
         state.apply_event(Event::Connected {
@@ -979,6 +1353,252 @@ mod tests {
             devices: vec![device(1, "block", "")],
         });
         assert!(state.pending.is_empty());
+    }
+
+    #[test]
+    fn a_device_on_the_port_its_rule_is_bound_to_is_not_prompted_about() {
+        let mut state = state();
+        state.set_policy(&policy(&[r#"allow hash "H1=" via-port "1-1""#]));
+        state.apply_event(Event::Connected {
+            devices: vec![device(1, "allow", "")],
+        });
+        assert!(state.pending.is_empty());
+        assert_eq!(state.port_mismatch(&state.devices[0]), None);
+    }
+
+    #[test]
+    fn a_bound_device_on_another_port_is_asked_about_and_told_why() {
+        // The rule does not match there, so the daemon blocked it. Treating
+        // the rule as covering it would leave a working device dead with
+        // nobody asked and nothing said.
+        let mut state = state();
+        state.set_policy(&policy(&[r#"allow hash "H1=" via-port "3-5""#]));
+        state.apply_event(Event::Connected {
+            devices: vec![device(1, "block", "")],
+        });
+        assert!(state.is_pending(1));
+        assert_eq!(
+            state.port_mismatch(&state.devices[0]),
+            Some(("3-5".to_string(), "1-1".to_string()))
+        );
+    }
+
+    #[test]
+    fn a_standing_rule_is_rebound_to_the_current_port_or_released() {
+        let mut state = state();
+        state.set_policy(&policy(&[r#"allow id 0781:5561 hash "H1=""#]));
+        state.apply_event(Event::Connected {
+            devices: vec![device(1, "allow", "")],
+        });
+        let plugged = state.devices[0].clone();
+
+        let bound = state.rebound_rule(&plugged, true).unwrap();
+        assert_eq!(bound, r#"allow id 0781:5561 hash "H1=" via-port "1-1""#);
+
+        state.set_policy(&policy(&[&bound]));
+        assert_eq!(state.standing_port(&plugged), Some("1-1"));
+        assert_eq!(
+            state.rebound_rule(&plugged, false).unwrap(),
+            r#"allow id 0781:5561 hash "H1=""#
+        );
+    }
+
+    #[test]
+    fn an_unplugged_device_cannot_be_bound_but_can_be_released() {
+        let mut state = state();
+        state.set_policy(&policy(&[r#"allow hash "H1=" via-port "3-5""#]));
+        let remembered = Device::remembered(r#"allow hash "H1=" via-port "3-5""#).unwrap();
+        assert_eq!(state.rebound_rule(&remembered, true), None);
+        assert_eq!(
+            state.rebound_rule(&remembered, false).as_deref(),
+            Some(r#"allow hash "H1=""#)
+        );
+    }
+
+    fn bolt(devices: &[(&str, &str)]) -> crate::thunderbolt::Snapshot {
+        crate::thunderbolt::Snapshot {
+            devices: devices
+                .iter()
+                .map(|(uid, status)| crate::thunderbolt::Device {
+                    uid: uid.to_string(),
+                    name: "Dock".into(),
+                    vendor: "Acme".into(),
+                    label: String::new(),
+                    kind: crate::thunderbolt::model::Kind::Peripheral,
+                    status: crate::thunderbolt::Status::parse(status),
+                    stored: false,
+                    policy: String::new(),
+                    domain: String::new(),
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_thunderbolt_device_already_waiting_at_startup_is_listed_but_not_announced() {
+        let mut state = state();
+        let effects = state.set_thunderbolt(bolt(&[("dock", "connected")]));
+        assert_eq!(state.thunderbolt_pending.len(), 1);
+        assert!(effects.is_empty(), "{effects:?}");
+    }
+
+    #[test]
+    fn a_thunderbolt_device_plugged_in_while_running_is_announced() {
+        let mut state = state();
+        state.set_thunderbolt(bolt(&[]));
+        let effects = state.set_thunderbolt(bolt(&[("dock", "connected")]));
+        assert!(effects.contains(&Effect::NotifyThunderbolt("dock".into())));
+        assert_eq!(state.pending_count(), 1);
+
+        // A second read with nothing new does not announce it again.
+        let again = state.set_thunderbolt(bolt(&[("dock", "connected")]));
+        assert!(again.is_empty(), "{again:?}");
+    }
+
+    #[test]
+    fn a_thunderbolt_prompt_is_withdrawn_once_the_device_is_allowed() {
+        let mut state = state();
+        state.set_thunderbolt(bolt(&[]));
+        state.set_thunderbolt(bolt(&[("dock", "connected")]));
+        state.set_thunderbolt_notification("dock", 42);
+
+        let effects = state.set_thunderbolt(bolt(&[("dock", "authorized")]));
+        assert!(state.thunderbolt_pending.is_empty());
+        assert_eq!(effects, vec![Effect::CloseNotification(42)]);
+    }
+
+    #[test]
+    fn dismissing_a_thunderbolt_prompt_lasts_until_the_device_stops_waiting() {
+        let mut state = state();
+        state.set_thunderbolt(bolt(&[("dock", "connected")]));
+        state.dismiss_thunderbolt("dock");
+        assert!(state.thunderbolt_waiting().is_empty());
+        // Nothing about the device itself changed.
+        assert!(state.thunderbolt.as_ref().unwrap().devices[0].is_waiting());
+
+        // The next refresh used to bring the prompt straight back.
+        state.set_thunderbolt(bolt(&[("dock", "connected")]));
+        assert!(state.thunderbolt_waiting().is_empty());
+
+        // Unplugged and plugged in again, it is asked about again.
+        state.set_thunderbolt(bolt(&[("dock", "disconnected")]));
+        state.set_thunderbolt(bolt(&[("dock", "connected")]));
+        assert_eq!(state.thunderbolt_waiting().len(), 1);
+    }
+
+    #[test]
+    fn a_failed_bolt_read_neither_drops_prompts_nor_reannounces_them() {
+        let mut state = state();
+        state.set_thunderbolt(bolt(&[("dock", "connected")]));
+        assert_eq!(state.thunderbolt_pending.len(), 1);
+
+        let failed = crate::thunderbolt::Snapshot {
+            error: Some("bolt timed out".into()),
+            ..Default::default()
+        };
+        assert!(state.set_thunderbolt(failed).is_empty());
+        assert_eq!(
+            state.thunderbolt_pending.len(),
+            1,
+            "a hiccup dropped the prompt"
+        );
+
+        let recovered = state.set_thunderbolt(bolt(&[("dock", "connected")]));
+        assert!(
+            recovered.is_empty(),
+            "the dock was announced as new: {recovered:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_first_read_is_not_the_baseline() {
+        // Startup with bolt slow to answer: the dock left plugged in
+        // overnight must not be announced once bolt does answer.
+        let mut state = state();
+        state.set_thunderbolt(crate::thunderbolt::Snapshot {
+            error: Some("bolt timed out".into()),
+            ..Default::default()
+        });
+        assert!(
+            state
+                .set_thunderbolt(bolt(&[("dock", "connected")]))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_notification_for_a_prompt_already_gone_is_reported_for_withdrawal() {
+        let mut state = state();
+        state.set_thunderbolt(bolt(&[("dock", "connected")]));
+        assert!(state.set_thunderbolt_notification("dock", 7));
+        assert!(!state.set_thunderbolt_notification("gone", 8));
+        assert!(!state.set_notification(99, 9));
+    }
+
+    #[test]
+    fn a_notification_click_does_not_act_on_a_device_that_inherited_the_id() {
+        let mut state = state();
+        state.apply_event(Event::Presence {
+            device: device(1, "block", ""),
+            event: PresenceEvent::Insert,
+        });
+        state.set_notification(1, 42);
+        assert_eq!(state.device_for_notification(42), Some(1));
+
+        // The daemon hands ID 1 to a different device before the click lands.
+        let other = Device::from_rule(1, r#"block id 0bad:0bad hash "OTHER=""#).unwrap();
+        state.devices = vec![other];
+        assert_eq!(state.device_for_notification(42), None);
+    }
+
+    #[test]
+    fn an_earlier_broad_rule_is_reported_as_overruling_the_devices_own() {
+        let mut state = state();
+        state.set_policy(&policy(&[
+            r#"allow id 0781:5561"#,
+            r#"block id 0781:5561 hash "H1=""#,
+        ]));
+        state.apply_event(Event::Connected {
+            devices: vec![device(1, "allow", "")],
+        });
+        let overruling = state.overriding_rule(&state.devices[0]).unwrap();
+        assert_eq!(overruling.rule.raw, "allow id 0781:5561");
+
+        // Placed after the device's own rule, it never gets a say.
+        state.set_policy(&policy(&[
+            r#"block id 0781:5561 hash "H1=""#,
+            r#"allow id 0781:5561"#,
+        ]));
+        assert!(state.overriding_rule(&state.devices[0]).is_none());
+    }
+
+    #[test]
+    fn a_dismissed_prompt_stays_dismissed_until_the_device_is_replugged() {
+        let mut state = state();
+        state.apply_event(Event::Presence {
+            device: device(1, "block", ""),
+            event: PresenceEvent::Insert,
+        });
+        state.dismiss_pending(1);
+        assert!(!state.is_pending(1));
+
+        // The next refresh used to put the prompt straight back.
+        state.apply_event(Event::Connected {
+            devices: vec![device(1, "block", "")],
+        });
+        assert!(!state.is_pending(1));
+
+        // Unplugged and plugged in again, it is asked about again.
+        state.apply_event(Event::Presence {
+            device: device(1, "block", ""),
+            event: PresenceEvent::Remove,
+        });
+        state.apply_event(Event::Presence {
+            device: device(1, "block", ""),
+            event: PresenceEvent::Insert,
+        });
+        assert!(state.is_pending(1));
     }
 
     #[test]
@@ -1069,6 +1689,7 @@ mod tests {
                 severity: crate::usbguard::Severity::Ok,
                 detail: String::new(),
                 remedy: None,
+                steps: None,
             }],
         });
         assert!(state.is_protected());
@@ -1094,6 +1715,7 @@ mod tests {
         state.devices.push(dev.clone());
         state.pending.push(Pending {
             device_id: 9,
+            hash: "H9=".into(),
             live: true,
             notification_id: None,
         });
@@ -1127,7 +1749,7 @@ mod tests {
     fn hidden_count_reflects_the_filters() {
         let mut state = state();
         state.config.settings.show_root_hubs = false;
-        let hub = Device::from_rule(1, r#"allow id 1d6b:0002 hash "R=""#).unwrap();
+        let hub = Device::from_rule(1, r#"allow id 1d6b:0002 hash "R=" via-port "usb1""#).unwrap();
         state.apply_event(Event::Connected {
             devices: vec![hub, device(2, "allow", "")],
         });
@@ -1175,6 +1797,7 @@ mod tests {
                 severity: crate::usbguard::Severity::Ok,
                 detail: String::new(),
                 remedy: None,
+                steps: None,
             }],
         };
         let bad = Health {
@@ -1183,6 +1806,7 @@ mod tests {
                 severity: crate::usbguard::Severity::Critical,
                 detail: "failed".into(),
                 remedy: None,
+                steps: None,
             }],
         };
 
@@ -1195,6 +1819,28 @@ mod tests {
 
         assert_eq!(after_first, before + 1, "the transition should be recorded");
         assert_eq!(after_second, after_first, "repeats should not be");
+    }
+
+    #[test]
+    fn tests_never_write_to_the_real_journal() {
+        // This test used to append a made-up "DaemonRunning: failed" to the
+        // user's real history on every run. Measured against the real file,
+        // so it fails if a test state ever persists again.
+        let size = || {
+            journal::path()
+                .and_then(|path| std::fs::metadata(path).ok())
+                .map(|m| m.len())
+        };
+        let before = size();
+
+        let mut state = state();
+        state.config.settings.journal_enabled = true;
+        state.record(Entry::system(Kind::HealthProblem, "from a test"));
+
+        // Recorded in memory, which is what the journaling tests rely on...
+        assert_eq!(state.history.len(), 1);
+        // ...and nowhere else.
+        assert_eq!(size(), before, "a test wrote to the real journal");
     }
 
     #[test]
@@ -1463,7 +2109,7 @@ mod tests {
     }
 
     #[test]
-    fn an_internal_mark_does_not_authorise_anything() {
+    fn an_internal_mark_does_not_authorize_anything() {
         // The mark must never be a back door to allowing a device. Nothing in
         // `set_internal` may change a target.
         let mut state = state();

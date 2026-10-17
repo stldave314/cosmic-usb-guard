@@ -13,9 +13,12 @@ use cosmic::widget::{self, column, container, icon, nav_bar, row, scrollable, te
 use cosmic::{ApplicationExt, Apply, Element};
 
 use crate::constants::{APP_ID, REPOSITORY, VERSION, WINDOW_DEFAULT_SIZE, WINDOW_MIN_SIZE};
-use crate::notify::{ACTION_ALLOW, ACTION_BLOCK, ACTION_DETAILS, ACTION_MANAGE, Notifier};
+use crate::notify::{
+    ACTION_ALLOW, ACTION_ALLOW_ONCE, ACTION_ALWAYS_ALLOW, ACTION_BLOCK, ACTION_DETAILS,
+    ACTION_MANAGE, Notifier,
+};
 use crate::state::{Effect, State};
-use crate::tasks::{self, Refreshed, Trigger};
+use crate::tasks::{self, Refreshed, ThunderboltAction, Trigger};
 use crate::tray::{Tray, TrayEvent, TrayState};
 use crate::ui::{self, Action};
 use crate::usbguard::{DeviceKey, Event};
@@ -24,8 +27,10 @@ use crate::{debug_log, fl};
 /// One page of the window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Page {
-    /// Connected devices and their authorisation.
+    /// Connected devices and their authorization.
     Devices,
+    /// Thunderbolt/USB4 settings and devices.
+    Thunderbolt,
     /// The decision journal.
     History,
     /// Installation health.
@@ -39,6 +44,7 @@ impl Page {
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
             "devices" => Some(Self::Devices),
+            "thunderbolt" => Some(Self::Thunderbolt),
             "history" => Some(Self::History),
             "status" => Some(Self::Status),
             "settings" => Some(Self::Settings),
@@ -47,14 +53,20 @@ impl Page {
     }
 
     /// Every page, in the order the navigation lists them.
-    pub const ALL: [Self; 4] = [Self::Devices, Self::History, Self::Status, Self::Settings];
+    pub const ALL: [Self; 5] = [
+        Self::Devices,
+        Self::Thunderbolt,
+        Self::History,
+        Self::Status,
+        Self::Settings,
+    ];
 }
 
-/// The page named by `--page`, if one was given and recognised.
+/// The page named by `--page`, if one was given and recognized.
 ///
 /// Lets the app be opened straight at a page — useful for a desktop action, a
 /// support instruction ("run it with `--page status`"), and for producing the
-/// documentation screenshots reproducibly. An unrecognised name is ignored
+/// documentation screenshots reproducibly. An unrecognized name is ignored
 /// rather than fatal: failing to start a security tool over a typo in an
 /// optional argument would be the wrong trade.
 fn requested_page() -> Option<Page> {
@@ -72,6 +84,38 @@ fn requested_page() -> Option<Page> {
     None
 }
 
+/// The device named by `--device <hash>`, if one was given.
+///
+/// Opens the app with that device's details expanded: for a support
+/// instruction ("start it with `--device <hash>` and look at the port"), and
+/// for documentation screenshots, where synthetic clicks do not reach the
+/// window. The hash is the one shown, and copyable, in the device details.
+fn requested_device() -> Option<String> {
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        let hash = match arg.strip_prefix("--device=") {
+            Some(hash) => Some(hash.to_string()),
+            None if arg == "--device" => args.next(),
+            None => None,
+        };
+        if let Some(hash) = hash.filter(|h| !h.is_empty()) {
+            return Some(hash);
+        }
+    }
+    None
+}
+
+/// A decision to record once the daemon has accepted it.
+#[derive(Debug, Clone)]
+pub struct Made {
+    /// The device as it was when the decision was made.
+    device: crate::usbguard::Device,
+    /// What was decided.
+    target: crate::usbguard::Target,
+    /// Whether a standing rule was written.
+    permanent: bool,
+}
+
 /// Messages handled by the window application.
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -84,8 +128,11 @@ pub enum Message {
     Event(Box<Event>),
     /// A refresh finished.
     Refreshed(Arc<Refreshed>),
-    /// A decision finished.
-    Decided(DeviceKey, Result<(), String>),
+    /// A decision finished, with what to record if it succeeded.
+    ///
+    /// Recorded on success rather than when the button is pressed: a decision
+    /// the daemon refused did not happen, and the history must not say it did.
+    Decided(DeviceKey, Option<Box<Made>>, Result<(), String>),
     /// A revocation finished.
     Revoked(DeviceKey, Result<usize, String>),
     /// Time to re-check health.
@@ -106,6 +153,14 @@ pub enum Message {
     ShowWindow,
     /// Hide the window but keep watching.
     HideWindow,
+    /// bolt reported a change.
+    ThunderboltChanged,
+    /// Thunderbolt was re-read on its own.
+    ThunderboltRefreshed(Option<crate::thunderbolt::Snapshot>),
+    /// A Thunderbolt action finished.
+    ThunderboltDone(String, ThunderboltAction, Result<(), String>),
+    /// A Thunderbolt prompt notification was posted.
+    ThunderboltNotified(String, Option<u32>),
     /// Nothing to report; lets a background task end without a message of
     /// its own.
     Noop,
@@ -125,6 +180,11 @@ pub struct App {
     notifier: Option<Notifier>,
     /// Whether the window is currently hidden to the tray.
     hidden: bool,
+    /// Whether this machine has Thunderbolt or USB4 at all. Fixed for the
+    /// life of the process: the controller is part of the machine.
+    has_thunderbolt: bool,
+    /// A device to expand once the first refresh has listed it.
+    select_on_load: Option<String>,
 }
 
 impl App {
@@ -188,7 +248,7 @@ impl App {
                         continue;
                     };
                     tasks.push(cosmic::task::future(async move {
-                        // `hooks::run` re-checks that the device is authorised;
+                        // `hooks::run` re-checks that the device is authorized;
                         // this path must never be the only thing standing
                         // between an untrusted device and a program.
                         crate::hooks::run(&hook, &device).await;
@@ -197,6 +257,27 @@ impl App {
                 }
 
                 Effect::ReloadHistory => self.state.reload_history(),
+
+                Effect::NotifyThunderbolt(uid) => {
+                    let device = self
+                        .state
+                        .thunderbolt
+                        .as_ref()
+                        .and_then(|s| s.device(&uid))
+                        .cloned();
+                    let (Some(notifier), Some(device)) = (self.notifier.clone(), device) else {
+                        continue;
+                    };
+                    tasks.push(cosmic::task::future(async move {
+                        let id = notifier.thunderbolt_prompt(&device).await;
+                        Message::ThunderboltNotified(uid, id)
+                    }));
+                }
+
+                Effect::ShowThunderbolt => {
+                    self.activate_page(Page::Thunderbolt);
+                    tasks.push(cosmic::task::message(Message::ShowWindow));
+                }
             }
         }
 
@@ -258,6 +339,35 @@ impl App {
         }
     }
 
+    /// Switch to a page, if it is in the navigation.
+    fn activate_page(&mut self, page: Page) {
+        let id = self
+            .nav
+            .iter()
+            .find(|id| self.nav.data::<Page>(*id) == Some(&page));
+        if let Some(id) = id {
+            self.nav.activate(id);
+        }
+    }
+
+    /// Run a Thunderbolt action, marking the device busy until it returns.
+    fn thunderbolt_action(&mut self, uid: String, action: ThunderboltAction) -> Task<Message> {
+        if !self.state.thunderbolt_busy.insert(uid.clone()) {
+            return Task::none();
+        }
+        cosmic::task::future(async move {
+            let (uid, result) = tasks::thunderbolt_action(uid, action).await;
+            Message::ThunderboltDone(uid, action, result)
+        })
+    }
+
+    /// Re-read Thunderbolt on its own.
+    fn refresh_thunderbolt(&self) -> Task<Message> {
+        cosmic::task::future(async {
+            Message::ThunderboltRefreshed(tasks::refresh_thunderbolt().await)
+        })
+    }
+
     /// Shut the status icon down and leave.
     fn quit(&mut self) -> Task<Message> {
         if let Some(tray) = self.tray.take() {
@@ -273,16 +383,25 @@ impl App {
                 key,
                 target,
                 permanent,
+                bind,
             } => {
                 let Some(device) = self.state.device_by_key(&key).cloned() else {
                     return Task::none();
                 };
                 self.state.busy.insert(key);
-                self.state.record_decision(&device, target, permanent);
-                let decision = tasks::Decision::new(&device, target);
+                // The switch belonged to this decision; it does not carry over.
+                if self.state.bind.is_some() && self.state.bind == device.daemon_id() {
+                    self.state.bind = None;
+                }
+                let decision = tasks::Decision::new(&device, target, permanent && bind);
+                let made = Box::new(Made {
+                    device,
+                    target,
+                    permanent,
+                });
                 cosmic::task::future(async move {
                     let (key, result) = tasks::decide(decision, target, permanent).await;
-                    Message::Decided(key, result)
+                    Message::Decided(key, Some(made), result)
                 })
             }
 
@@ -301,6 +420,31 @@ impl App {
                 cosmic::task::future(async move {
                     let (key, result) = tasks::revoke(key, daemon_id, hash).await;
                     Message::Revoked(key, result)
+                })
+            }
+
+            Action::SetBound { key, bound } => {
+                let Some(device) = self.state.device_by_key(&key).cloned() else {
+                    return Task::none();
+                };
+                let Some(rule) = self.state.rebound_rule(&device, bound) else {
+                    return Task::none();
+                };
+                // Either way the rewritten rule covers the device where it is
+                // now: bound to its current port, or to none. A plugged-in
+                // device the old rule did not cover — blocked because it was
+                // on another port — is given the rule's decision now rather
+                // than left blocked with its prompt cleared.
+                let apply = device.daemon_id().zip(
+                    self.state
+                        .standing_target(&device)
+                        .filter(|target| *target != device.target),
+                );
+                self.state.busy.insert(key.clone());
+                let hash = device.hash.clone();
+                cosmic::task::future(async move {
+                    let (key, result) = tasks::replace_rule(key, hash, rule, apply).await;
+                    Message::Decided(key, None, result)
                 })
             }
 
@@ -370,8 +514,13 @@ impl App {
                 Task::none()
             }
 
+            Action::SetBind { device_id, bind } => {
+                self.state.bind = bind.then_some(device_id);
+                Task::none()
+            }
+
             Action::DismissPrompt { device_id } => {
-                let effects = self.state.resolve_pending(device_id);
+                let effects = self.state.dismiss_pending(device_id);
                 self.run_effects(effects)
             }
 
@@ -409,6 +558,25 @@ impl App {
 
             Action::ClearHistory => {
                 self.state.clear_history();
+                Task::none()
+            }
+
+            Action::ThunderboltAuthorize { uid } => {
+                self.thunderbolt_action(uid, ThunderboltAction::Authorize)
+            }
+            Action::ThunderboltEnroll { uid } => {
+                self.thunderbolt_action(uid, ThunderboltAction::Enroll)
+            }
+            Action::ThunderboltForget { uid } => {
+                self.thunderbolt_action(uid, ThunderboltAction::Forget)
+            }
+            Action::ThunderboltDismiss { uid } => {
+                let effects = self.state.dismiss_thunderbolt(&uid);
+                self.run_effects(effects)
+            }
+
+            Action::ShowStatus => {
+                self.activate_page(Page::Status);
                 Task::none()
             }
 
@@ -503,21 +671,40 @@ impl cosmic::Application for App {
     }
 
     fn init(core: Core, _flags: Self::Flags) -> (Self, Task<Message>) {
-        let wanted = requested_page().unwrap_or(Page::Devices);
+        let has_thunderbolt = crate::thunderbolt::sysfs::present();
+        let wanted = requested_page()
+            .filter(|page| *page != Page::Thunderbolt || has_thunderbolt)
+            .unwrap_or(Page::Devices);
         let mut nav = nav_bar::Model::default();
         for page in Page::ALL {
-            let (label, icon_name) = match page {
-                Page::Devices => (fl!("page-devices"), ui::icons::DEVICE),
-                Page::History => (fl!("page-history"), ui::icons::HISTORY),
-                Page::Status => (fl!("page-status"), ui::icons::PANEL_OK),
-                Page::Settings => (fl!("page-settings"), ui::icons::SETTINGS),
+            // Only where there is a controller: an empty Thunderbolt page on a
+            // machine without one would only raise a question with no answer.
+            if page == Page::Thunderbolt && !has_thunderbolt {
+                continue;
+            }
+            let (label, page_icon) = match page {
+                Page::Devices => (
+                    fl!("page-devices"),
+                    icon::from_name(ui::icons::DEVICE).icon(),
+                ),
+                Page::Thunderbolt => (
+                    fl!("page-thunderbolt"),
+                    icon::icon(ui::icons::thunderbolt()),
+                ),
+                Page::History => (
+                    fl!("page-history"),
+                    icon::from_name(ui::icons::HISTORY).icon(),
+                ),
+                Page::Status => (
+                    fl!("page-status"),
+                    icon::from_name(ui::icons::PANEL_OK).icon(),
+                ),
+                Page::Settings => (
+                    fl!("page-settings"),
+                    icon::from_name(ui::icons::SETTINGS).icon(),
+                ),
             };
-            let id = nav
-                .insert()
-                .text(label)
-                .icon(icon::from_name(icon_name))
-                .data(page)
-                .id();
+            let id = nav.insert().text(label).icon(page_icon).data(page).id();
             if page == wanted {
                 nav.activate(id);
             }
@@ -541,6 +728,8 @@ impl cosmic::Application for App {
             tray: None,
             notifier: None,
             hidden: false,
+            has_thunderbolt,
+            select_on_load: requested_device(),
         };
 
         // Without this the window and its header render untitled, which in the
@@ -560,7 +749,7 @@ impl cosmic::Application for App {
         let tray = app.sync_tray();
 
         let hide = if minimized {
-            debug_log!(crate::debug::UI, "starting minimised to the status icon");
+            debug_log!(crate::debug::UI, "starting minimized to the status icon");
             app.hide_window()
         } else {
             Task::none()
@@ -574,7 +763,7 @@ impl cosmic::Application for App {
             hide,
         ]);
 
-        debug_log!(crate::debug::UI, "window application initialised");
+        debug_log!(crate::debug::UI, "window application initialized");
         (app, task)
     }
 
@@ -588,7 +777,7 @@ impl cosmic::Application for App {
     /// Without this the close button silently turns off the thing the app is
     /// for: the daemon still blocks devices, but nothing asks the user about
     /// them and no hook ever runs. Quit is on the status icon's menu, and the
-    /// behaviour is a setting for anyone who wants close to mean close.
+    /// behavior is a setting for anyone who wants close to mean close.
     fn on_close_requested(&self, _id: cosmic::iced::window::Id) -> Option<Message> {
         // With no status icon there would be no way back to the window, so
         // hiding would strand the user with an invisible running process.
@@ -611,13 +800,19 @@ impl cosmic::Application for App {
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        Subscription::batch([
+        let mut subscriptions = vec![
             crate::subscription::usbguard_events().map(|e| Message::Event(Box::new(e))),
             crate::subscription::refresh_ticks().map(|()| Message::Tick),
             crate::subscription::tray_events().map(Message::Tray),
             crate::subscription::notification_actions()
                 .map(|(id, action)| Message::NotificationAction(id, action)),
-        ])
+        ];
+        if self.has_thunderbolt {
+            subscriptions.push(
+                crate::subscription::thunderbolt_events().map(|()| Message::ThunderboltChanged),
+            );
+        }
+        Subscription::batch(subscriptions)
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
@@ -629,35 +824,111 @@ impl cosmic::Application for App {
                 let reload = self.run_effects(effects);
                 let tray = self.sync_tray();
                 // A policy change may have added or removed a standing rule.
-                Task::batch([reload, tray, self.refresh(Trigger::Manual)])
+                //
+                // Automatic, not manual: the daemon sent this, the user did
+                // not ask for anything. A manual refresh clears the latch that
+                // stops a refused call being retried, and a device that
+                // re-enumerates over and over would otherwise keep clearing it.
+                Task::batch([reload, tray, self.refresh(Trigger::Automatic)])
             }
 
             Message::Refreshed(refreshed) => {
-                match &refreshed.devices {
+                // The effects' tasks are kept, not discarded: they include
+                // withdrawing notifications for prompts that no longer apply,
+                // which otherwise stayed on screen with nothing behind them.
+                let devices = match &refreshed.devices {
                     Ok(devices) => {
                         let effects = self.state.apply_event(Event::Connected {
                             devices: devices.clone(),
                         });
-                        let _ = self.run_effects(effects);
+                        self.run_effects(effects)
                     }
                     Err(reason) => {
                         let effects = self.state.apply_event(Event::Disconnected {
                             reason: reason.clone(),
                         });
-                        let _ = self.run_effects(effects);
+                        self.run_effects(effects)
                     }
-                }
+                };
                 if let Some(rules) = refreshed.rules.as_deref() {
                     self.state.set_policy(rules);
                 }
                 self.state.set_health(refreshed.health.clone());
-                self.sync_tray()
+                // Only once there is a device list to find it in.
+                if refreshed.devices.is_ok()
+                    && let Some(hash) = self.select_on_load.take()
+                {
+                    self.state.selected = self.state.key_for_hash(&hash);
+                }
+                let thunderbolt = match refreshed.thunderbolt.clone() {
+                    Some(snapshot) => {
+                        let effects = self.state.set_thunderbolt(snapshot);
+                        self.run_effects(effects)
+                    }
+                    None => Task::none(),
+                };
+                Task::batch([devices, thunderbolt, self.sync_tray()])
             }
 
-            Message::Decided(key, result) => {
+            Message::ThunderboltChanged => self.refresh_thunderbolt(),
+
+            Message::ThunderboltRefreshed(snapshot) => {
+                let Some(snapshot) = snapshot else {
+                    return Task::none();
+                };
+                let effects = self.state.set_thunderbolt(snapshot);
+                let notify = self.run_effects(effects);
+                Task::batch([notify, self.sync_tray()])
+            }
+
+            Message::ThunderboltDone(uid, action, result) => {
+                self.state.thunderbolt_busy.remove(&uid);
+                match result {
+                    Ok(()) => {
+                        debug_log!(crate::debug::THUNDERBOLT, "{action:?} {uid}: done");
+                        if let Some(device) = self
+                            .state
+                            .thunderbolt
+                            .as_ref()
+                            .and_then(|s| s.device(&uid))
+                            .cloned()
+                        {
+                            self.state.record_thunderbolt(&device, action);
+                        }
+                        let effects = match action {
+                            ThunderboltAction::Forget => Vec::new(),
+                            _ => self.state.resolve_thunderbolt(&uid),
+                        };
+                        let close = self.run_effects(effects);
+                        Task::batch([close, self.refresh_thunderbolt()])
+                    }
+                    Err(message) => {
+                        self.state.error = Some(message);
+                        self.refresh_thunderbolt()
+                    }
+                }
+            }
+
+            Message::ThunderboltNotified(uid, Some(notification_id)) => {
+                if self
+                    .state
+                    .set_thunderbolt_notification(&uid, notification_id)
+                {
+                    Task::none()
+                } else {
+                    self.run_effects(vec![Effect::CloseNotification(notification_id)])
+                }
+            }
+            Message::ThunderboltNotified(_, None) => Task::none(),
+
+            Message::Decided(key, made, result) => {
                 self.state.busy.remove(&key);
                 match result {
                     Ok(()) => {
+                        if let Some(made) = made {
+                            self.state
+                                .record_decision(&made.device, made.target, made.permanent);
+                        }
                         // Only a connected device can have had a prompt raised
                         // for it, so there is nothing to resolve otherwise.
                         let effects = match &key {
@@ -735,12 +1006,31 @@ impl cosmic::Application for App {
             }
 
             Message::Notified(device_id, Some(notification_id)) => {
-                self.state.set_notification(device_id, notification_id);
-                Task::none()
+                if self.state.set_notification(device_id, notification_id) {
+                    Task::none()
+                } else {
+                    self.run_effects(vec![Effect::CloseNotification(notification_id)])
+                }
             }
             Message::Notified(_, None) => Task::none(),
 
             Message::NotificationAction(notification_id, action) => {
+                if let Some(uid) = self.state.thunderbolt_for_notification(notification_id) {
+                    return match action.as_str() {
+                        ACTION_ALLOW_ONCE => {
+                            self.thunderbolt_action(uid, ThunderboltAction::Authorize)
+                        }
+                        ACTION_ALWAYS_ALLOW => {
+                            self.thunderbolt_action(uid, ThunderboltAction::Enroll)
+                        }
+                        ACTION_DETAILS => {
+                            self.activate_page(Page::Thunderbolt);
+                            self.show_window()
+                        }
+                        _ => Task::none(),
+                    };
+                }
+
                 let Some(device_id) = self.state.device_for_notification(notification_id) else {
                     // A refusal notice is not tied to a pending decision, so
                     // there is nothing to look up; opening the window is still
@@ -758,11 +1048,15 @@ impl cosmic::Application for App {
                         key,
                         target: crate::usbguard::Target::Allow,
                         permanent: self.state.permanent,
+                        // Binding is chosen in the window, where the port is
+                        // shown; a notification button is not the place.
+                        bind: false,
                     }),
                     ACTION_BLOCK => self.on_action(Action::Decide {
                         key,
                         target: crate::usbguard::Target::Block,
                         permanent: self.state.permanent,
+                        bind: false,
                     }),
                     ACTION_DETAILS | ACTION_MANAGE => {
                         self.state.selected = Some(key);
@@ -785,6 +1079,7 @@ impl cosmic::Application for App {
 
         let page: Element<'_, Action> = match self.page() {
             Page::Devices => self.devices_view(),
+            Page::Thunderbolt => ui::thunderbolt::view(&self.state),
             Page::History => ui::history::view(&self.state),
             Page::Status => ui::health::view(&self.state),
             Page::Settings => column::with_capacity(2)
@@ -797,11 +1092,7 @@ impl cosmic::Application for App {
         let mut content = column::with_capacity(2).spacing(space.space_s);
 
         if let Some(error) = self.state.error.as_ref() {
-            content = content.push(
-                widget::warning(error.clone())
-                    .on_close(Message::DismissError)
-                    .into_widget(),
-            );
+            content = content.push(ui::error_banner(error.clone(), Message::DismissError));
         }
 
         content = content.push(page.map(Message::Ui));
@@ -841,10 +1132,11 @@ mod tests {
         // A page missing from `from_name` would make `--page` silently open
         // the wrong one, and a page missing from `ALL` would vanish from the
         // navigation entirely.
-        assert_eq!(Page::ALL.len(), 4);
+        assert_eq!(Page::ALL.len(), 5);
         for page in Page::ALL {
             let name = match page {
                 Page::Devices => "devices",
+                Page::Thunderbolt => "thunderbolt",
                 Page::History => "history",
                 Page::Status => "status",
                 Page::Settings => "settings",
