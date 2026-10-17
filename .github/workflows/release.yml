@@ -45,6 +45,10 @@ jobs:
 
       - name: Test
         run: cargo test --all-features
+        env:
+          # The runner has no COSMIC icon theme; the test that checks icon
+          # names against it fails without this rather than skipping quietly.
+          ICON_TEST_WITHOUT_COSMIC: "1"
 
       # A release must never ship with developer logging on, and that has to be
       # mechanical rather than remembered. install.sh passes the feature to
@@ -55,7 +59,7 @@ jobs:
       - name: Build all packages
         run: ./install.sh package
 
-      - name: List artefacts
+      - name: List artifacts
         run: ls -lh dist/
 
       - name: Publish release
