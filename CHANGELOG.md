@@ -5,6 +5,26 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1]
+
+### Security
+
+- The polkit rule 0.3.0 offered for permission problems made *deciding*
+  passwordless — `applyDevicePolicy` and `appendRule` — for active local
+  members of `sudo`, `wheel` and `plugdev`. On Debian and Ubuntu that matches
+  what the distribution already grants, but elsewhere it removed the password
+  that stops someone at an unlocked session from authorizing a device. Being
+  asked for a password before a decision is a sound configuration, so it now
+  passes the check, and nothing offers to remove it.
+- The only fix still offered grants rule *removal* alone
+  (`50-usbguard-remove-rule.rules`), and only when this session can already
+  make decisions without a password, so it never widens what the session can
+  do. Running it also removes the broader `50-usbguard-desktop.rules`. If you
+  applied that by hand: `sudo rm /etc/polkit-1/rules.d/50-usbguard-desktop.rules`.
+- The Thunderbolt permission check no longer offers a rule making bolt's
+  authorize, enroll and manage actions passwordless. Being asked passes; a
+  refusal is explained with steps, not overridden.
+
 ## [0.3.0]
 
 ### Added

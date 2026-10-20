@@ -138,6 +138,7 @@ observed-no-bus = 未连接到系统总线
 observed-responding = 有响应
 observed-granted = 已授予
 observed-password = 需要管理员密码
+observed-asks-password = 会要求输入密码，这没有问题
 observed-refused = 被拒绝
 observed-polkit-unavailable = polkit 不可用
 observed-rules = 策略中的规则数：{ $count }
@@ -258,7 +259,7 @@ error-permission-denied = 不允许
 error-autostart = 无法更改自动启动设置：{ $message }
 error-no-tray = 此桌面没有系统托盘，因此无法显示状态图标。USB 卫士改为打开了窗口。
 error-cannot-remove-rule = 删除常驻规则需要管理员授权，但未获得授权。请参阅状态页面中的“您可以撤销永久决定”。
-error-thunderbolt-permission = 您无权授权雷电设备。状态页面的“您可以允许雷电设备”下有解决方法。
+error-thunderbolt-permission = 您无法在此会话中授权雷电设备。状态页面的“您可以允许雷电设备”下说明了原因。
 error-bolt-unavailable = 雷电服务（bolt）未运行。状态页面会说明如何启动它。
 error-thunderbolt = 雷电服务报告了错误：{ $message }
 

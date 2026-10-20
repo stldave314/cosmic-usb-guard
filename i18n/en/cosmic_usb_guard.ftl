@@ -141,6 +141,7 @@ observed-no-bus = no connection to the system bus
 observed-responding = responding
 observed-granted = granted
 observed-password = requires an administrator password
+observed-asks-password = asks for a password, which is fine
 observed-refused = refused
 observed-polkit-unavailable = polkit unavailable
 observed-rules = rules in the policy: { $count }
@@ -264,7 +265,7 @@ error-permission-denied = Not permitted
 error-autostart = Could not change the autostart setting: { $message }
 error-no-tray = This desktop has no system tray, so the status icon could not be shown. USB Guard opened its window instead.
 error-cannot-remove-rule = Removing a standing rule needs administrator authorization, which was not given. See "You may undo a permanent decision" on the Status page.
-error-thunderbolt-permission = You are not allowed to authorize Thunderbolt devices. The Status page has a fix under "You may allow Thunderbolt devices".
+error-thunderbolt-permission = You are not allowed to authorize Thunderbolt devices from this session. The Status page explains why under "You may allow Thunderbolt devices".
 error-bolt-unavailable = The Thunderbolt service (bolt) is not running. The Status page shows how to start it.
 error-thunderbolt = The Thunderbolt service reported an error: { $message }
 

@@ -155,9 +155,11 @@ administrator password by default:
   undoing a decision needs.
 - **Elsewhere**, all three ask for a password.
 
-The Status page checks both and, where either needs a password, offers a
-polkit rule that grants all three to active local members of `sudo`, `wheel`
-and `plugdev`.
+Being asked for a password before a device is authorized is a sound setup,
+and the Status page treats it as one: it never offers to make deciding
+passwordless. The one thing it does offer a fix for is the Debian and Ubuntu
+mismatch, where deciding is free but undoing asks for an administrator — see
+[Changing a decision](#changing-a-decision).
 
 **3. Hold new devices for a decision instead of auto-authorizing them.**
 
@@ -310,11 +312,19 @@ password. The polkit rules Debian and Ubuntu ship for USBGuard give
 leave `removeRule` at `auth_admin`, so undoing a decision raises an
 authentication dialog even though making one does not. The Status page reports
 this as **You may undo a permanent decision** and offers a drop-in polkit rule,
-`/etc/polkit-1/rules.d/50-usbguard-desktop.rules`, that grants making,
-writing and removing to active local members of `sudo`, `wheel` and
-`plugdev`. Granting removal is not a widening in practice: `appendRule` takes
-an insert position, so anyone who can already append a rule can put an `allow`
-at the top of the policy — which is strictly more powerful than removing one.
+`/etc/polkit-1/rules.d/50-usbguard-remove-rule.rules`, that grants removal —
+and only removal — to active local members of `sudo`, `wheel` and `plugdev`.
+It is only offered when your session can already make decisions without a
+password, because only then is it no widening: `appendRule` takes an insert
+position, so anyone who can append a rule can put an `allow` at the top of the
+policy, which is strictly more powerful than removing one. Where making a
+decision asks for a password too, undoing one asking for the same is
+consistent, and the check passes.
+
+Version 0.3.0 offered a broader rule, `50-usbguard-desktop.rules`, that also
+made deciding passwordless. If you applied it, the current command removes
+it, or remove it yourself:
+`sudo rm /etc/polkit-1/rules.d/50-usbguard-desktop.rules`.
 
 ### Binding a decision to a port
 
@@ -552,10 +562,16 @@ usbguard-dbus.service`. It is a separate unit from `usbguard.service` and is not
 enabled by default on most distributions.
 
 **Allow asks for a password every time, or says it was not permitted.**
-Polkit decides this, not USBGuard: check **You may make policy decisions** on
-the Status page. If it says a password is required, take the polkit rule it
-offers. `usbguard add-user` does not help here — it changes who may use the
-`usbguard` command line, not what polkit allows the desktop.
+Polkit decides this, not USBGuard. Asking for a password is the upstream
+default and a reasonable one — whoever is at the keyboard proves who they are
+before a device is let in — so the Status page counts it as fine. Debian,
+Ubuntu and Pop!\_OS let `sudo` and `plugdev` members decide without one; on
+other distributions, an administrator can add a polkit rule for
+`org.usbguard.Devices1.applyDevicePolicy` and `org.usbguard.Policy1.appendRule`
+if they decide the trade is worth it. If it says *refused*, polkit is refusing
+this session outright; see the next entry. `usbguard add-user` does not help
+here — it changes who may use the `usbguard` command line, not what polkit
+allows the desktop.
 
 **The Status page says reading was refused and shows "To fix it" steps.**
 Polkit lets only the active, local session read from USBGuard. Over SSH, in a
@@ -568,16 +584,15 @@ Expected on a stock Debian, Ubuntu or Pop!\_OS install. The polkit rules shipped
 with USBGuard grant `appendRule` and `applyDevicePolicy` to the `sudo` and
 `plugdev` groups but not `removeRule`, so making a decision is unattended and
 undoing one is not. Authenticate when asked, or take the drop-in rule the
-Status page offers under **You may undo a permanent decision**. If you used the
-rule an earlier version offered, `50-usbguard-remove-rule.rules`, the new
-command replaces it.
+Status page offers under **You may undo a permanent decision**, which grants
+removal alone.
 
 **I ran the command from the Status page, it printed nothing, and rule removal
 still asks for a password.**
 Printing nothing is normal; check whether polkit actually loaded the rule:
 
 ```sh
-journalctl -u polkit -b | grep usbguard-desktop
+journalctl -u polkit -b | grep usbguard-remove-rule
 ```
 
 `Error loading script` means polkitd cannot read the file. Earlier versions of

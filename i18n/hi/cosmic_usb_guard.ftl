@@ -144,6 +144,7 @@ observed-no-bus = सिस्टम बस से कोई कनेक्श�
 observed-responding = जवाब दे रहा है
 observed-granted = दी गई
 observed-password = व्यवस्थापक पासवर्ड चाहिए
+observed-asks-password = पासवर्ड माँगता है, जो ठीक है
 observed-refused = अस्वीकृत
 observed-polkit-unavailable = polkit उपलब्ध नहीं
 observed-rules = नीति में नियम: { $count }
@@ -267,7 +268,7 @@ error-permission-denied = अनुमति नहीं
 error-autostart = स्वतः प्रारंभ सेटिंग नहीं बदली जा सकी: { $message }
 error-no-tray = इस डेस्कटॉप में सिस्टम ट्रे नहीं है, इसलिए स्थिति चिह्न नहीं दिखाया जा सका। USB गार्ड ने इसके बजाय अपनी विंडो खोल दी।
 error-cannot-remove-rule = स्थायी नियम हटाने के लिए प्रशासक की अनुमति चाहिए, जो नहीं मिली। स्थिति पृष्ठ पर “आप स्थायी निर्णय वापस ले सकते हैं” देखें।
-error-thunderbolt-permission = आपको Thunderbolt डिवाइसों को अधिकृत करने की अनुमति नहीं है। स्थिति पेज पर "आप Thunderbolt डिवाइसों को अनुमति दे सकते हैं" के नीचे समाधान है।
+error-thunderbolt-permission = इस सत्र से आपको Thunderbolt डिवाइसों को अधिकृत करने की अनुमति नहीं है। स्थिति पेज पर "आप Thunderbolt डिवाइसों को अनुमति दे सकते हैं" के नीचे इसका कारण बताया गया है।
 error-bolt-unavailable = Thunderbolt सेवा (bolt) नहीं चल रही है। स्थिति पेज बताता है कि इसे कैसे शुरू करें।
 error-thunderbolt = Thunderbolt सेवा ने एक त्रुटि बताई: { $message }
 

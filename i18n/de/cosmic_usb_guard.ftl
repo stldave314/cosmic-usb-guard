@@ -144,6 +144,7 @@ observed-no-bus = keine Verbindung zum Systembus
 observed-responding = antwortet
 observed-granted = erteilt
 observed-password = erfordert ein Administratorpasswort
+observed-asks-password = fragt nach einem Passwort, was in Ordnung ist
 observed-refused = abgelehnt
 observed-polkit-unavailable = polkit nicht verfügbar
 observed-rules = Regeln in der Richtlinie: { $count }
@@ -267,7 +268,7 @@ error-permission-denied = Nicht erlaubt
 error-autostart = Die Autostart-Einstellung konnte nicht geändert werden: { $message }
 error-no-tray = Dieser Desktop hat keinen Systemabschnitt, daher konnte das Statussymbol nicht angezeigt werden. USB Guard hat stattdessen sein Fenster geöffnet.
 error-cannot-remove-rule = Das Entfernen einer dauerhaften Regel erfordert eine Administrator-Autorisierung, die nicht erteilt wurde. Siehe „Sie dürfen eine dauerhafte Entscheidung rückgängig machen“ auf der Statusseite.
-error-thunderbolt-permission = Sie dürfen keine Thunderbolt-Geräte autorisieren. Die Statusseite bietet unter „Sie dürfen Thunderbolt-Geräte erlauben“ eine Lösung.
+error-thunderbolt-permission = Sie dürfen in dieser Sitzung keine Thunderbolt-Geräte autorisieren. Die Statusseite erklärt unter „Sie dürfen Thunderbolt-Geräte erlauben“, warum.
 error-bolt-unavailable = Der Thunderbolt-Dienst (bolt) läuft nicht. Die Statusseite zeigt, wie Sie ihn starten.
 error-thunderbolt = Der Thunderbolt-Dienst meldete einen Fehler: { $message }
 

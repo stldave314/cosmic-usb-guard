@@ -138,6 +138,7 @@ observed-no-bus = 시스템 버스에 연결되지 않음
 observed-responding = 응답 중
 observed-granted = 허용됨
 observed-password = 관리자 비밀번호 필요
+observed-asks-password = 비밀번호를 묻습니다(정상입니다)
 observed-refused = 거부됨
 observed-polkit-unavailable = polkit을 사용할 수 없음
 observed-rules = 정책의 규칙 수: { $count }
@@ -258,7 +259,7 @@ error-permission-denied = 허용되지 않음
 error-autostart = 자동 시작 설정을 변경할 수 없습니다: { $message }
 error-no-tray = 이 데스크톱에는 시스템 트레이가 없어 상태 아이콘을 표시할 수 없었습니다. 대신 USB 가드 창을 열었습니다.
 error-cannot-remove-rule = 상시 규칙을 삭제하려면 관리자 승인이 필요하지만 승인되지 않았습니다. 상태 페이지의 “영구적인 결정을 되돌릴 권한이 있음”을 참고하세요.
-error-thunderbolt-permission = Thunderbolt 장치를 승인할 권한이 없습니다. 상태 페이지의 "Thunderbolt 장치를 허용할 수 있습니다" 아래에 해결 방법이 있습니다.
+error-thunderbolt-permission = 이 세션에서는 Thunderbolt 장치를 승인할 수 없습니다. 이유는 상태 페이지의 "Thunderbolt 장치를 허용할 수 있습니다"에서 설명합니다.
 error-bolt-unavailable = Thunderbolt 서비스(bolt)가 실행 중이 아닙니다. 상태 페이지에서 시작하는 방법을 볼 수 있습니다.
 error-thunderbolt = Thunderbolt 서비스가 오류를 보고했습니다: { $message }
 

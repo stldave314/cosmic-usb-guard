@@ -20,26 +20,6 @@ use super::sysfs::{self, KernelDomain};
 /// authorization actions.
 const ACTION_ENROLL: &str = "org.freedesktop.bolt.enroll";
 
-/// Shell command granting bolt's actions to administrators without a password.
-///
-/// The same groups that already administer the machine, and the same shape as
-/// the rule Debian and Ubuntu ship for `sudo`; this adds `wheel` for the
-/// distributions that use it instead. Written with `install -m 0644` for the
-/// reason given at `usbguard::health::POLKIT_REMEDY`: polkitd must be able to
-/// read it, whatever the caller's umask.
-const BOLT_POLKIT_REMEDY: &str = concat!(
-    "sudo install -m 0644 /dev/stdin /etc/polkit-1/rules.d/50-bolt-authorize.rules <<'EOF'\n",
-    "polkit.addRule(function(action, subject) {\n",
-    "    if ((action.id == \"org.freedesktop.bolt.authorize\" ||\n",
-    "         action.id == \"org.freedesktop.bolt.enroll\" ||\n",
-    "         action.id == \"org.freedesktop.bolt.manage\") &&\n",
-    "        subject.active && subject.local &&\n",
-    "        (subject.isInGroup(\"sudo\") || subject.isInGroup(\"wheel\"))) {\n",
-    "        return polkit.Result.YES;\n",
-    "    }\n",
-    "});\nEOF"
-);
-
 /// Describe each domain's value of something, e.g. `domain0: user`.
 fn describe(domains: &[KernelDomain], value: impl Fn(&KernelDomain) -> String) -> String {
     domains
@@ -159,23 +139,22 @@ pub fn service_check(bolt: &Result<Snapshot, Error>, installed: bool) -> Check {
 }
 
 /// Whether this user may authorize Thunderbolt devices.
+///
+/// Being asked for a password passes: proving who is at the keyboard before a
+/// device gets PCIe access is bolt's own default, and a sound one, so the app
+/// offers nothing to remove it. A refusal for the active local session is an
+/// administrator's choice and is reported with the session steps but no rule
+/// to override it; the usual cause is a session that is not the active local
+/// one.
 pub fn permission_check(authorization: Result<Authorization, String>) -> Check {
+    let id = CheckId::ThunderboltPermission;
     match authorization {
-        Ok(Authorization::Granted) => Check::ok(
-            CheckId::ThunderboltPermission,
-            crate::fl!("observed-granted"),
-        ),
-        Ok(Authorization::Challenge) => Check::warn(
-            CheckId::ThunderboltPermission,
-            crate::fl!("observed-password"),
-            Some(BOLT_POLKIT_REMEDY.to_string()),
-        ),
-        Ok(Authorization::Refused) => Check::warn(
-            CheckId::ThunderboltPermission,
-            crate::fl!("observed-refused"),
-            Some(BOLT_POLKIT_REMEDY.to_string()),
-        ),
-        Err(detail) => Check::warn(CheckId::ThunderboltPermission, detail, None),
+        Ok(Authorization::Granted) => Check::ok(id, crate::fl!("observed-granted")),
+        Ok(Authorization::Challenge) => Check::ok(id, crate::fl!("observed-asks-password")),
+        Ok(Authorization::Refused) => {
+            Check::warn(id, crate::fl!("observed-refused"), None).with_steps(Steps::InactiveSession)
+        }
+        Err(detail) => Check::warn(id, detail, None),
     }
 }
 
@@ -322,15 +301,17 @@ mod tests {
     }
 
     #[test]
-    fn needing_a_password_to_authorize_offers_the_polkit_rule() {
-        let check = permission_check(Ok(Authorization::Challenge));
-        assert_eq!(check.severity, Severity::Warning);
-        let remedy = check.remedy.unwrap();
-        assert!(remedy.starts_with("sudo install -m 0644 /dev/stdin "));
-        assert!(!remedy.contains("tee"));
+    fn being_asked_for_a_password_to_authorize_passes_and_nothing_is_offered() {
+        let asks = permission_check(Ok(Authorization::Challenge));
+        assert_eq!(asks.severity, Severity::Ok);
+        assert_eq!(asks.remedy, None);
         assert_eq!(
             permission_check(Ok(Authorization::Granted)).severity,
             Severity::Ok
         );
+        let refused = permission_check(Ok(Authorization::Refused));
+        assert_eq!(refused.severity, Severity::Warning);
+        assert_eq!(refused.remedy, None);
+        assert_eq!(refused.steps, Some(Steps::InactiveSession));
     }
 }

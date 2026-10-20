@@ -144,6 +144,7 @@ observed-no-bus = aucune connexion au bus système
 observed-responding = répond
 observed-granted = accordé
 observed-password = nécessite un mot de passe administrateur
+observed-asks-password = demande un mot de passe, ce qui est normal
 observed-refused = refusé
 observed-polkit-unavailable = polkit indisponible
 observed-rules = règles dans la politique : { $count }
@@ -267,7 +268,7 @@ error-permission-denied = Non autorisé
 error-autostart = Impossible de modifier le paramètre de démarrage automatique : { $message }
 error-no-tray = Ce bureau n'a pas de zone de notification ; l'icône d'état n'a pas pu être affichée. USB Guard a ouvert sa fenêtre à la place.
 error-cannot-remove-rule = La suppression d'une règle permanente nécessite une autorisation d'administrateur, qui n'a pas été accordée. Voir « Vous pouvez annuler une décision permanente » sur la page État.
-error-thunderbolt-permission = Vous n’êtes pas autorisé à autoriser des appareils Thunderbolt. La page État propose une solution sous « Vous pouvez autoriser les appareils Thunderbolt ».
+error-thunderbolt-permission = Vous n’êtes pas autorisé à autoriser des appareils Thunderbolt depuis cette session. La page État explique pourquoi sous « Vous pouvez autoriser les appareils Thunderbolt ».
 error-bolt-unavailable = Le service Thunderbolt (bolt) n’est pas en cours d’exécution. La page État indique comment le démarrer.
 error-thunderbolt = Le service Thunderbolt a signalé une erreur : { $message }
 

@@ -272,30 +272,54 @@ const ACTION_APPLY_POLICY: &str = "org.usbguard.Devices1.applyDevicePolicy";
 /// Polkit action guarding rule removal, which is what undoing a decision needs.
 const ACTION_REMOVE_RULE: &str = "org.usbguard.Policy1.removeRule";
 
-/// A polkit answer about one of the calls this app makes, as a check.
+/// Whether this session may make a decision about a device.
 ///
 /// Asked of Polkit rather than of USBGuard, because there is no harmless way
-/// to ask USBGuard: the calls change policy, so probing with the real one
-/// would mean making a decision — or deleting a rule — to find out whether
-/// that is allowed.
+/// to ask USBGuard: probing with the real call would mean making a decision to
+/// find out whether that is allowed.
 ///
-/// The three outcomes are genuinely different and are reported as such:
-/// allowed outright, allowed after authenticating (workable, so a warning),
-/// and refused.
-async fn polkit_permission(connection: &zbus::Connection, id: CheckId, action: &str) -> Check {
-    match polkit_check(connection, action).await {
+/// Being asked for a password passes. Requiring someone at the keyboard to
+/// prove who they are before a device is authorized is a sound configuration
+/// — it is the upstream default — and the app does not offer to remove it. A
+/// refusal for the active local session is an administrator's deliberate
+/// choice, so it is reported with the session steps but no rule to override
+/// it; the usual cause is a session that is not the active local one.
+pub fn decision_check(apply: &Result<Authorization, String>) -> Check {
+    let id = CheckId::IpcPermission;
+    match apply {
         Ok(Authorization::Granted) => Check::ok(id, crate::fl!("observed-granted")),
-        Ok(Authorization::Challenge) => Check::warn(
-            id,
-            crate::fl!("observed-password"),
-            Some(POLKIT_REMEDY.to_string()),
-        ),
-        Ok(Authorization::Refused) => Check::critical(
-            id,
-            crate::fl!("observed-refused"),
-            Some(POLKIT_REMEDY.to_string()),
-        ),
-        Err(detail) => Check::warn(id, detail, None),
+        Ok(Authorization::Challenge) => Check::ok(id, crate::fl!("observed-asks-password")),
+        Ok(Authorization::Refused) => Check::critical(id, crate::fl!("observed-refused"), None)
+            .with_steps(Steps::InactiveSession),
+        Err(detail) => Check::warn(id, detail.clone(), None),
+    }
+}
+
+/// Whether this session may undo a decision, judged against whether it may
+/// make one.
+///
+/// The problem is not a password as such but an inconsistency: Debian and
+/// Ubuntu let `sudo` and `plugdev` members make a decision without one, yet
+/// still ask an administrator before one can be taken back. Only in that case
+/// is the fix offered, and it grants removal alone — no widening, since a
+/// session that may append a rule can already put an `allow` at the top of
+/// the policy. Where making a decision asks for a password too, undoing one
+/// asking for the same is consistent, and passes.
+pub fn undo_check(
+    remove: &Result<Authorization, String>,
+    apply: &Result<Authorization, String>,
+) -> Check {
+    let id = CheckId::DecisionsReversible;
+    let deciding_is_free = matches!(apply, Ok(Authorization::Granted));
+    let remedy = deciding_is_free.then(|| REMOVE_RULE_REMEDY.to_string());
+    match remove {
+        Ok(Authorization::Granted) => Check::ok(id, crate::fl!("observed-granted")),
+        Ok(Authorization::Challenge) if !deciding_is_free => {
+            Check::ok(id, crate::fl!("observed-asks-password"))
+        }
+        Ok(Authorization::Challenge) => Check::warn(id, crate::fl!("observed-password"), remedy),
+        Ok(Authorization::Refused) => Check::critical(id, crate::fl!("observed-refused"), remedy),
+        Err(detail) => Check::warn(id, detail.clone(), None),
     }
 }
 
@@ -344,22 +368,19 @@ pub async fn polkit_check(
     }
 }
 
-/// Shell command that grants the three calls this app makes — making a
-/// decision, writing a rule, and removing one — to active local members of
-/// the administrator and `plugdev` groups.
+/// Shell command that lets active local members of `sudo`, `wheel` and
+/// `plugdev` remove a policy rule, which is what undoing a decision needs.
 ///
-/// Debian and Ubuntu already grant the first two to `sudo` and `plugdev`; the
-/// upstream defaults ask for an administrator password for all three, and
-/// removal is left at that everywhere. Granting removal is not a widening in
-/// practice: `appendRule` takes an insert position, so anyone who may append
-/// a rule can put an `allow` at the top of the policy.
+/// Only offered where this session may already make decisions without a
+/// password (see [`undo_check`]); it grants nothing that would authorize a
+/// device by itself. An earlier version offered a broader rule,
+/// `50-usbguard-desktop.rules`, that also made deciding passwordless; this
+/// command removes it.
 ///
 /// Written as a drop-in file rather than an edit to the packaged rules, so a
 /// package upgrade cannot silently revert it and nothing already there is
 /// disturbed. `50-` sorts before the shipped `org.usbguard1.rules`; Polkit
-/// takes the first rule that returns a result. The file an earlier version
-/// suggested, which granted removal alone, is removed so the two cannot
-/// disagree.
+/// takes the first rule that returns a result.
 ///
 /// `install -m 0644`, not `sudo tee`. polkitd runs as its own `polkitd` user
 /// and has to be able to read the file, and `tee` creates it with whatever
@@ -368,13 +389,11 @@ pub async fn polkit_check(
 /// "Error loading script", the rule silently never applies, and the command
 /// itself printed nothing to suggest anything went wrong. `install` sets the
 /// mode explicitly, and replacing the file is also what makes polkit reload.
-pub(crate) const POLKIT_REMEDY: &str = concat!(
-    "sudo install -m 0644 /dev/stdin /etc/polkit-1/rules.d/50-usbguard-desktop.rules <<'EOF'",
-    " && sudo rm -f /etc/polkit-1/rules.d/50-usbguard-remove-rule.rules\n",
+pub(crate) const REMOVE_RULE_REMEDY: &str = concat!(
+    "sudo install -m 0644 /dev/stdin /etc/polkit-1/rules.d/50-usbguard-remove-rule.rules <<'EOF'",
+    " && sudo rm -f /etc/polkit-1/rules.d/50-usbguard-desktop.rules\n",
     "polkit.addRule(function(action, subject) {\n",
-    "    if ((action.id == \"org.usbguard.Devices1.applyDevicePolicy\" ||\n",
-    "         action.id == \"org.usbguard.Policy1.appendRule\" ||\n",
-    "         action.id == \"org.usbguard.Policy1.removeRule\") &&\n",
+    "    if (action.id == \"org.usbguard.Policy1.removeRule\" &&\n",
     "        subject.active && subject.local &&\n",
     "        (subject.isInGroup(\"plugdev\") || subject.isInGroup(\"sudo\") ||\n",
     "         subject.isInGroup(\"wheel\"))) {\n",
@@ -485,11 +504,10 @@ pub async fn evaluate(
     // can be refused while reading works. Both are invisible until someone
     // presses a button, so they are asked about here.
     if let Some(connection) = connection {
-        checks
-            .push(polkit_permission(connection, CheckId::IpcPermission, ACTION_APPLY_POLICY).await);
-        checks.push(
-            polkit_permission(connection, CheckId::DecisionsReversible, ACTION_REMOVE_RULE).await,
-        );
+        let apply = polkit_check(connection, ACTION_APPLY_POLICY).await;
+        let remove = polkit_check(connection, ACTION_REMOVE_RULE).await;
+        checks.push(decision_check(&apply));
+        checks.push(undo_check(&remove, &apply));
     }
 
     checks.push(policy_check(rules));
@@ -568,10 +586,60 @@ mod tests {
         // polkitd is not root. A file created through the caller's umask can
         // come out unreadable to it, and then the rule never loads.
         assert!(
-            POLKIT_REMEDY.starts_with("sudo install -m 0644 /dev/stdin "),
-            "the remedy must set the file mode itself: {POLKIT_REMEDY}"
+            REMOVE_RULE_REMEDY.starts_with("sudo install -m 0644 /dev/stdin "),
+            "the remedy must set the file mode itself: {REMOVE_RULE_REMEDY}"
         );
-        assert!(!POLKIT_REMEDY.contains("tee"));
+        assert!(!REMOVE_RULE_REMEDY.contains("tee"));
+    }
+
+    #[test]
+    fn the_polkit_remedy_grants_removal_and_nothing_that_authorizes() {
+        // Making a decision, or writing a rule, would authorize a device.
+        assert!(REMOVE_RULE_REMEDY.contains("org.usbguard.Policy1.removeRule"));
+        assert!(!REMOVE_RULE_REMEDY.contains("applyDevicePolicy"));
+        assert!(!REMOVE_RULE_REMEDY.contains("appendRule"));
+        // And it takes away the broader rule an earlier version offered.
+        assert!(
+            REMOVE_RULE_REMEDY.contains("rm -f /etc/polkit-1/rules.d/50-usbguard-desktop.rules")
+        );
+    }
+
+    #[test]
+    fn being_asked_for_a_password_before_a_decision_passes() {
+        use Authorization::*;
+        assert_eq!(decision_check(&Ok(Granted)).severity, Severity::Ok);
+        let asks = decision_check(&Ok(Challenge));
+        assert_eq!(asks.severity, Severity::Ok);
+        // No rule is ever offered to make deciding passwordless.
+        assert_eq!(asks.remedy, None);
+        let refused = decision_check(&Ok(Refused));
+        assert_eq!(refused.severity, Severity::Critical);
+        assert_eq!(refused.remedy, None);
+        assert_eq!(refused.steps, Some(Steps::InactiveSession));
+    }
+
+    #[test]
+    fn the_undo_fix_is_offered_only_where_deciding_is_already_passwordless() {
+        use Authorization::*;
+        // Debian and Ubuntu: deciding is free, undoing asks. The trap.
+        let trap = undo_check(&Ok(Challenge), &Ok(Granted));
+        assert_eq!(trap.severity, Severity::Warning);
+        assert!(trap.remedy.is_some());
+
+        // Upstream defaults: both ask. Consistent, so it passes, no rule.
+        let consistent = undo_check(&Ok(Challenge), &Ok(Challenge));
+        assert_eq!(consistent.severity, Severity::Ok);
+        assert_eq!(consistent.remedy, None);
+
+        // Refused outright: reported, but overridden only where deciding is
+        // already free.
+        assert!(undo_check(&Ok(Refused), &Ok(Granted)).remedy.is_some());
+        assert_eq!(undo_check(&Ok(Refused), &Ok(Challenge)).remedy, None);
+
+        assert_eq!(
+            undo_check(&Ok(Granted), &Ok(Challenge)).severity,
+            Severity::Ok
+        );
     }
 
     #[test]

@@ -138,6 +138,7 @@ observed-no-bus = sistem veri yoluna bağlantı yok
 observed-responding = yanıt veriyor
 observed-granted = verildi
 observed-password = yönetici parolası gerektiriyor
+observed-asks-password = parola soruyor, bu sorun değil
 observed-refused = reddedildi
 observed-polkit-unavailable = polkit kullanılamıyor
 observed-rules = ilkedeki kural sayısı: { $count }
@@ -258,7 +259,7 @@ error-permission-denied = İzin verilmedi
 error-autostart = Otomatik başlatma ayarı değiştirilemedi: { $message }
 error-no-tray = Bu masaüstünde sistem tepsisi yok, bu yüzden durum simgesi gösterilemedi. USB Guard bunun yerine penceresini açtı.
 error-cannot-remove-rule = Kalıcı bir kuralı kaldırmak yönetici yetkisi gerektirir ve bu yetki verilmedi. Durum sayfasındaki “Kalıcı bir kararı geri alabilirsiniz” maddesine bakın.
-error-thunderbolt-permission = Thunderbolt aygıtlarını yetkilendirme izniniz yok. Durum sayfasında "Thunderbolt aygıtlarına izin verebilirsiniz" altında bir çözüm var.
+error-thunderbolt-permission = Bu oturumdan Thunderbolt aygıtlarını yetkilendirme izniniz yok. Nedeni Durum sayfasında "Thunderbolt aygıtlarına izin verebilirsiniz" altında açıklanıyor.
 error-bolt-unavailable = Thunderbolt hizmeti (bolt) çalışmıyor. Durum sayfası nasıl başlatılacağını gösterir.
 error-thunderbolt = Thunderbolt hizmeti bir hata bildirdi: { $message }
 

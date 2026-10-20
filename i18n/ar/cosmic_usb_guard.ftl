@@ -152,6 +152,7 @@ observed-no-bus = لا يوجد اتصال بناقل النظام
 observed-responding = يستجيب
 observed-granted = ممنوح
 observed-password = يتطلب كلمة مرور المسؤول
+observed-asks-password = يطلب كلمة مرور، وهذا أمر سليم
 observed-refused = مرفوض
 observed-polkit-unavailable = polkit غير متاح
 observed-rules = عدد القواعد في السياسة: { $count }
@@ -279,7 +280,7 @@ error-permission-denied = غير مسموح
 error-autostart = تعذّر تغيير إعداد البدء التلقائي: { $message }
 error-no-tray = لا تحتوي بيئة سطح المكتب هذه على صينية نظام، لذا تعذّر إظهار أيقونة الحالة. فتح حارس USB نافذته بدلًا من ذلك.
 error-cannot-remove-rule = تتطلب إزالة قاعدة دائمة تصريحًا من المسؤول، ولم يُمنح. راجِع «يمكنك التراجع عن قرار دائم» في صفحة الحالة.
-error-thunderbolt-permission = غير مسموح لك بتخويل أجهزة Thunderbolt. في صفحة الحالة حل تحت "يمكنك السماح بأجهزة Thunderbolt".
+error-thunderbolt-permission = غير مسموح لك بتخويل أجهزة Thunderbolt من هذه الجلسة. توضح صفحة الحالة السبب تحت "يمكنك السماح بأجهزة Thunderbolt".
 error-bolt-unavailable = خدمة Thunderbolt ‏(bolt) لا تعمل. توضح صفحة الحالة كيفية تشغيلها.
 error-thunderbolt = أبلغت خدمة Thunderbolt عن خطأ: { $message }
 

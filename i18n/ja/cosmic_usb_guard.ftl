@@ -138,6 +138,7 @@ observed-no-bus = システムバスに接続していません
 observed-responding = 応答あり
 observed-granted = 許可
 observed-password = 管理者パスワードが必要
+observed-asks-password = パスワードを求めます (問題ありません)
 observed-refused = 拒否
 observed-polkit-unavailable = polkit を利用できません
 observed-rules = ポリシー内のルール数: { $count }
@@ -258,7 +259,7 @@ error-permission-denied = 許可されていません
 error-autostart = 自動起動の設定を変更できませんでした: { $message }
 error-no-tray = このデスクトップにはシステムトレイがないため、状態アイコンを表示できませんでした。代わりに USB ガードのウィンドウを開きました。
 error-cannot-remove-rule = 常設ルールの削除には管理者の承認が必要ですが、承認されませんでした。状態ページの「恒久的な判断を取り消す権限がある」をご覧ください。
-error-thunderbolt-permission = Thunderbolt デバイスを承認する権限がありません。ステータスページの「Thunderbolt デバイスを許可できます」に解決方法があります。
+error-thunderbolt-permission = このセッションでは Thunderbolt デバイスを承認できません。理由はステータスページの「Thunderbolt デバイスを許可できます」で説明しています。
 error-bolt-unavailable = Thunderbolt サービス (bolt) が動作していません。起動方法はステータスページに表示されます。
 error-thunderbolt = Thunderbolt サービスがエラーを報告しました: { $message }
 

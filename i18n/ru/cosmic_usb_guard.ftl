@@ -146,6 +146,7 @@ observed-no-bus = нет подключения к системной шине
 observed-responding = отвечает
 observed-granted = разрешено
 observed-password = требуется пароль администратора
+observed-asks-password = запрашивает пароль, и это нормально
 observed-refused = отказано
 observed-polkit-unavailable = polkit недоступен
 observed-rules = правил в политике: { $count }
@@ -270,7 +271,7 @@ error-permission-denied = Не разрешено
 error-autostart = Не удалось изменить настройку автозапуска: { $message }
 error-no-tray = На этом рабочем столе нет системного лотка, поэтому значок состояния показать не удалось. Вместо этого USB Guard открыл своё окно.
 error-cannot-remove-rule = Для удаления постоянного правила требуется авторизация администратора, которая не была предоставлена. См. «Вы можете отменить постоянное решение» на странице состояния.
-error-thunderbolt-permission = Вам не разрешено авторизовать устройства Thunderbolt. На странице «Состояние» есть решение в пункте «Вы можете разрешать устройства Thunderbolt».
+error-thunderbolt-permission = В этом сеансе вам не разрешено авторизовать устройства Thunderbolt. Причина объяснена на странице «Состояние» в пункте «Вы можете разрешать устройства Thunderbolt».
 error-bolt-unavailable = Служба Thunderbolt (bolt) не запущена. На странице «Состояние» показано, как её запустить.
 error-thunderbolt = Служба Thunderbolt сообщила об ошибке: { $message }
 
